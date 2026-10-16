@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+runs/
+.agent_calls/
+.simex_private/
+.tools/node_modules/
+.coverage
+htmlcov/
+build/
+dist/
+.env
+.env.*
