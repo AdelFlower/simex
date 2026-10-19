@@ -145,10 +145,10 @@ def test_defaults_and_calibration_do_not_mutate_source_task():
     original = copy.deepcopy(scene)
     checked = validate_scene(scene)
     assert scene == original
-    assert checked['plates'][0]['mass'] == .15
+    assert checked['plates'][0]['mass'] == .03
     calibrated = calibrated_scene(checked, {'mass_scale': 2, 'friction_scale': .3})
-    assert calibrated['plates'][0]['mass'] == .3
-    assert checked['plates'][0]['mass'] == .15
+    assert calibrated['plates'][0]['mass'] == .06
+    assert checked['plates'][0]['mass'] == .03
     assert calibrated['plates'][0]['friction'] == checked['plates'][0]['friction']
     assert calibrated['physics']['contact_friction_scale'] == .3
 

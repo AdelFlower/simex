@@ -14,12 +14,16 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import re
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+from .contracts import CAPABILITY_GUIDANCE
+from .research_context import (ContextError, MAX_IMAGES, MAX_PROMPT_CHARS, MAX_READ_ROUNDS,
+                               READ_CHARS, ResearchContext, apply_source_edits, prepare_edit_context)
 from .tasks import TASK_IDS, make_task, source_task_from_spec
 
 
@@ -32,7 +36,9 @@ DEFAULTS = {
 METHODS = ("direct_cap", "stage1_transfer", "simex")
 CAPABILITY_FILES = ("toolbox.py", "skill.md")
 PROVENANCE_KEYS = ("model", "codex_version", "reasoning_effort", "agent_timeout",
-                   "policy_timeout", "max_sim_time", "isaac_asset", "source_policy_workers")
+                   "policy_timeout", "max_sim_time", "isaac_asset", "source_policy_workers",
+                   "stage1_reasoning_effort", "stage2_reasoning_effort", "evaluation_reasoning_effort",
+                   "stage1_agent_timeout", "stage2_agent_timeout", "evaluation_agent_timeout")
 TOOLBOX_CONTRACT = (
     "Runtime contract: toolbox.py must define class Toolbox with __init__(self,robot). "
     "The policy receives tb=Toolbox(robot); preserve existing public methods because "
@@ -45,15 +51,13 @@ TOOLBOX_CONTRACT = (
     "Use robot.gripper(width) for grippers, never a method named open. "
     "All object positions must come from RGBD during execution; do not bake source "
     "task poses into the library. Retain measured uncertainties in skill.md."
-)
+) + "\n\n" + CAPABILITY_GUIDANCE
 TASK_SPEC_HELP = (
     "Each task is {name,description,base_task_id,seed,scene_overrides,predicate}. "
     f"base_task_id is one of {list(TASK_IDS)}. Use small reachable scene variations. "
     "Use scene_overrides only for plates and tote initially; keep plate names/colors "
-    "green and red because those are the initial perception classes. Example: "
-    '{"plates":[{"name":"green","position":[0.55,0.17,0.004],"radius":0.07,'
-    '"mass":0.15,"friction":0.6},{"name":"red","position":[0.32,0.26,0.004]}],'
-    '"tote":{"position":[0.39,-0.26,0],"yaw":0.0}}. Plate bounds: x [0.15,0.75], '
+    "green and red because those are the initial perception classes. Copy plate fields "
+    "from the supplied current scene template before varying them. Plate bounds: x [0.15,0.75], "
     "abs(y)<=0.45, z [0,0.25], radius [0.03,0.12], mass [0.02,1], friction [0.1,2]. "
     "A predicate is "
     '{"all":[{"kind":"lift","object":"green","min":0.05},'
@@ -62,7 +66,12 @@ TASK_SPEC_HELP = (
     "weaken a predicate after seeing an outcome. Task descriptions must tell "
     "the policy what to achieve without object truth poses. If overriding plates, "
     "supply complete plate objects, including names and all geometry/appearance "
-    "fields from the source scene template; keep targets consistent with the plates."
+    "fields from source_scene_template; inherit its current mass, friction and dimensions. "
+    "Do not copy physical parameters from an example. For intentional mass, friction or "
+    "geometry changes, also return scene_change_reasons: an object mapping the zero-based "
+    "task index (as a string) to the experimental reason for those changes. The harness "
+    "records the actual experimental variables and flags missing explanations without "
+    "changing or resampling tasks. Keep targets consistent with plates."
 )
 
 
@@ -209,6 +218,9 @@ def _initialize(run_dir: Path, config: dict) -> dict:
     manifest_path = run_dir / "manifest.json"
     manifest = _json(manifest_path)
     if manifest is not None:
+        if manifest.get("format_version") != 3:
+            raise ResearchError("Stage 1 protocol changed; create a new run to preserve experiment provenance")
+        _check_selection_sets(run_dir, manifest)
         if any(manifest["config"][key] != cfg[key] for key in DEFAULTS):
             raise ResearchError("Research budgets/seeds cannot change when resuming a run")
         if manifest.get("provenance") != _provenance(cfg):
@@ -228,6 +240,8 @@ def _initialize(run_dir: Path, config: dict) -> dict:
                  for i, task_id in enumerate(TASK_IDS)
                  for j in range(cfg["selection_trials"])]
     _save(run_dir / "selection_tasks.json", selection)
+    auxiliary = _auxiliary_selection_tasks(cfg)
+    _save(run_dir / "auxiliary_selection_tasks.json", auxiliary)
     slots = {}
     for i, task_id in enumerate(TASK_IDS):
         for trial in range(cfg["adapt_trials"]):
@@ -243,12 +257,86 @@ def _initialize(run_dir: Path, config: dict) -> dict:
                               "seed": cfg["seed"] + 30000 + i * 1000 + trial,
                               "state": "pending"}
     _save(run_dir / "target_ledger.json", {"slots": slots})
-    _save(manifest_path, {"format_version": 2, "config": cfg, "provenance": _provenance(cfg),
+    _save(manifest_path, {"format_version": 3, "config": cfg, "provenance": _provenance(cfg),
                           "selection_sha256": _digest(selection),
+                          "auxiliary_selection_sha256": _digest(auxiliary),
                           "target_schedule_sha256": _digest({k: {a: b for a, b in v.items()
                               if a != "state"} for k, v in slots.items()}),
                           "initial_sha256": toolbox_hash(run_dir / "frozen" / "initial")})
     return cfg
+
+
+def _auxiliary_selection_tasks(cfg: dict) -> list[dict]:
+    """Common frozen tie-breakers, never supplied to discovery researchers."""
+    tasks = []
+    for kind, threshold, instruction in (
+        ("lift", .05, "将绿色盘抬高至少5厘米"),
+        ("displaced", .03, "使绿色盘相对初始位置移动至少3厘米"),
+    ):
+        for index in range(2):
+            task = make_task(TASK_IDS[index], cfg["seed"] + 15000 + index)
+            task["name"] = f"selection_{kind}_{index}"
+            task["description"] = instruction + "，红盘必须留在箱外。"
+            task["predicate"] = {"all": [{"kind": kind, "object": "green", "min": threshold},
+                                          {"kind": "outside", "object": "red"}]}
+            tasks.append(task)
+    return tasks
+
+
+def _check_selection_sets(run_dir: Path, manifest: dict):
+    for filename, field in (("selection_tasks.json", "selection_sha256"),
+                            ("auxiliary_selection_tasks.json", "auxiliary_selection_sha256")):
+        values = _json(run_dir / filename)
+        if values is None or _digest(values) != manifest.get(field):
+            raise ResearchError(f"Frozen source selection tasks were modified: {filename}")
+
+
+def _scene_context() -> dict:
+    templates = {task_id: make_task(task_id, 0)["scene"] for task_id in TASK_IDS}
+    return {"source_scene_template": templates[TASK_IDS[0]], "source_scene_templates": templates}
+
+
+def _record_scene_variations(response: dict, tasks: list[dict], path: Path):
+    """Audit source experiments without adding hidden metadata to policy inputs."""
+    reasons = response.get("scene_change_reasons", {})
+    if not isinstance(reasons, dict):
+        reasons = {}
+    def differences(before, after, prefix=""):
+        # Plate order is not an experimental variable. Compare validated objects
+        # by identity, including additions/removals, rather than list position.
+        if prefix == "plates" and isinstance(before, list) and isinstance(after, list):
+            return differences({item["name"]: item for item in before},
+                               {item["name"]: item for item in after}, prefix)
+        if isinstance(before, dict) and isinstance(after, dict):
+            return [change for key in sorted(set(before) | set(after))
+                    for change in differences(before.get(key), after.get(key), f"{prefix}.{key}".strip("."))]
+        if isinstance(before, list) and isinstance(after, list) and len(before) == len(after):
+            return [change for index, (left, right) in enumerate(zip(before, after))
+                    for change in differences(left, right, f"{prefix}.{index}")]
+        return [] if before == after else [{"field": prefix, "template": before, "experiment": after}]
+    records = []
+    physical_fields = {"mass", "friction", "radius", "thickness", "rim_height", "inner_size", "wall_thickness"}
+    for index, (spec, task) in enumerate(zip(response["tasks"], tasks)):
+        template = source_task_from_spec({"base_task_id": spec.get("base_task_id", TASK_IDS[0]),
+                                          "seed": spec.get("seed", 0)})["scene"]
+        changes = differences(template, task["scene"])
+        physical = [change for change in changes if set(change["field"].split(".")) & physical_fields
+                    or (change["field"].startswith("plates.") and change["field"].count(".") == 1)]
+        reason = reasons.get(str(index))
+        record = {"task_index": index, "task_sha256": _digest(task), "template_sha256": _digest(template),
+                  "source_scene_template": template, "changes": changes,
+                  "physical_changes": physical,
+                  "experimental_variables": [change["field"] for change in physical],
+                  "experimental_reason": reason if isinstance(reason, str) else None,
+                  "declaration_status": ("not_needed" if not physical else
+                      "explained" if isinstance(reason, str) and reason.strip() else "missing_reason")}
+        records.append(record)
+    previous = _json(path)
+    if previous is not None and previous != records:
+        raise ResearchError(f"Frozen source scene variation record changed: {path}")
+    _save(path, records)
+    return [{key: value for key, value in record.items() if key != "source_scene_template"}
+            for record in records]
 
 
 def _images(value: Any) -> list[str]:
@@ -272,31 +360,97 @@ def _images(value: Any) -> list[str]:
 
 
 def _ask(agent, path: Path, role: str, instruction: str, payload: dict) -> dict:
+    """Research decisions can request bounded public evidence; policies cannot.
+
+    Each successful read turn is checkpointed separately. Transient transport
+    failures get one retry here, never in policy generation or physical trials.
+    """
+    from .agent import AgentTransportError
+
     if role in ("discover_revision", "repair"):
         instruction += "\n\n" + TOOLBOX_CONTRACT
-    image_paths = _images(payload)
-    if image_paths:
-        instruction += "\n\nAttached images, in order (each contact sheet labels its rollout and phases):\n" + \
-            json.dumps([{"image": i + 1, "path": path} for i, path in enumerate(image_paths)])
-    prompt = instruction + "\n\nINPUT JSON:\n" + json.dumps(payload, ensure_ascii=False, default=str)
-    request = {"role": role, "prompt": prompt, "images": image_paths}
+    instruction, pinned_keys, block_edits = prepare_edit_context(role, instruction, payload)
+    context = ResearchContext(payload, _images(payload), instruction=instruction, pinned_keys=pinned_keys)
+    input_hash = _digest({"role": role, "instruction": instruction, "context": context.input_sha256})
     previous = _json(path)
     if previous is not None:
-        if previous["request_sha256"] != _digest(request):
+        if previous.get("input_sha256") != input_hash:
             raise ResearchError(f"Checkpoint input changed: {path}")
         return previous["response"]
-    _agent_capacity(agent)
+    directory = path.with_suffix(".context")
+    context.persist(directory)
+    notes, replies, reads_so_far, image_ids = "", [], [], None
+    initial_request = None
     try:
-        response = agent.ask(role=role, prompt=prompt, images=image_paths)
+        for turn in range(MAX_READ_ROUNDS + 1):
+            prompt, image_paths = context.prompt(instruction, round_index=turn, notes=notes,
+                replies=replies, reads_so_far=reads_so_far, image_ids=image_ids)
+            request = {"role": role, "prompt": prompt, "images": image_paths}
+            if initial_request is None:
+                initial_request = request
+            turn_path = directory / f"turn_{turn:02d}.json"
+            saved = _json(turn_path)
+            if saved is not None:
+                if saved["request_sha256"] != _digest(request):
+                    raise ResearchError(f"Research read checkpoint changed: {turn_path}")
+                response = saved["response"]
+            else:
+                for attempt in range(2):
+                    _agent_capacity(agent)
+                    print(f"[SimEX] research_request role={role} read_round={turn} "
+                          f"prompt_chars={len(prompt)} images={len(image_paths)} "
+                          f"raw_payload_chars={context.raw_chars}", flush=True)
+                    try:
+                        response = agent.ask(role=role, prompt=prompt, images=image_paths)
+                        break
+                    except AgentTransportError as exc:
+                        errors_path = directory / f"turn_{turn:02d}.transport_errors.json"
+                        errors = _json(errors_path, [])
+                        errors.append({"error": str(exc), "agent_count": getattr(agent, "count", None),
+                                       "time_unix": time.time(), "automatic_retry": attempt == 0})
+                        _save(errors_path, errors)
+                        if attempt:
+                            raise
+                        print(f"[SimEX] research_transport_retry role={role} read_round={turn} "
+                              "retry=1/1; no rollout is repeated", flush=True)
+                if not isinstance(response, dict):
+                    raise ResearchError(f"Agent role {role} returned a non-object")
+                _save(turn_path, {"request_sha256": _digest(request), "request": request,
+                    "response": response, "agent_count": getattr(agent, "count", None)})
+            if "evidence_requests" not in response:
+                if block_edits:
+                    try:
+                        response = apply_source_edits(response, payload["toolbox"])
+                    except ContextError as exc:
+                        response = {"invalid_edits": str(exc), "source_edits": response,
+                                    "hypothesis": response.get("hypothesis")}
+                _save(path, {"input_sha256": input_hash, "request_sha256": _digest(initial_request),
+                    "request": initial_request, "response": response,
+                    "agent_count": getattr(agent, "count", None), "read_rounds": turn,
+                    "context_directory": str(directory)})
+                return response
+            if turn == MAX_READ_ROUNDS:
+                raise ResearchError("Research evidence read budget exhausted without a decision; checkpoint retained")
+            if set(response) - {"evidence_requests", "notes"} or not isinstance(response.get("notes", ""), str):
+                raise ResearchError("Evidence reads must be separate from the final decision and use text notes")
+            notes = response.get("notes", "")
+            try:
+                # Reserve headroom for notes, read indexes, image labels and
+                # serialization. Large capability files remain complete.
+                base_prompt, _ = context.prompt(instruction)
+                read_budget = min(READ_CHARS, MAX_PROMPT_CHARS-len(base_prompt)-7_000)
+                replies, requested_images = context.read(response["evidence_requests"], budget=read_budget)
+                image_ids = requested_images or context.image_ids[:MAX_IMAGES]
+                reads_so_far += [{key: item[key] for key in ("id", "offset", "end", "found", "attached")
+                                  if key in item} for item in replies]
+            except ContextError as exc:
+                # A bad read consumes a dialogue turn, not a simulator trial.
+                # Give a bounded public error so the agent can correct the ID.
+                replies = [{"read_error": str(exc)}]
     except Exception as exc:
         _save(path.with_suffix(".error.json"), {"role": role, "error": str(exc),
               "exception": type(exc).__name__, "agent_count": getattr(agent, "count", None)})
         raise
-    if not isinstance(response, dict):
-        raise ResearchError(f"Agent role {role} returned a non-object")
-    _save(path, {"request_sha256": _digest(request), "request": request,
-                 "response": response, "agent_count": getattr(agent, "count", None)})
-    return response
 
 
 def _public(result: dict) -> dict:
@@ -315,7 +469,7 @@ def _public(result: dict) -> dict:
     evidence = summarize_public_evidence(evidence, result.get("output_dir"))
     allowed = ("status", "success", "reason", "trace_tail", "robot_trace_tail",
                "read_images", "keyframes", "stdout", "initial_visual_estimates",
-               "phase_images", "visual_phases", "motion_summary", "actions",
+               "phase_images", "visual_phases", "motion_summary", "actions", "action_summary",
                "video", "recording_errors", "evidence_errors")
     selected = {key: evidence[key] for key in allowed if key in evidence}
     if selected.get("phase_images"):
@@ -333,6 +487,8 @@ def _public(result: dict) -> dict:
 def _candidate(proposal: dict, directory: Path) -> tuple[Path | None, dict]:
     """Invalid code spends this proposal slot; it never triggers resampling on resume."""
     try:
+        if proposal.get("invalid_edits"):
+            raise InvalidToolbox(proposal["invalid_edits"])
         toolbox = _write_toolbox(directory / "toolbox", proposal)
     except InvalidToolbox as exc:
         outcome = {"status": "invalid_candidate", "reason": str(exc)}
@@ -359,7 +515,8 @@ def _outcome_summary(public_result: dict | None) -> dict | None:
     return {"status": public_result.get("status"), "success": public_result.get("success"),
             "steps": public_result.get("steps"), "reason": evidence.get("reason", ""),
             "stdout": evidence.get("stdout", "")[-2000:],
-            "motion_summary": evidence.get("motion_summary")}
+            "motion_summary": evidence.get("motion_summary"),
+            "action_summary": evidence.get("action_summary")}
 
 
 def _run(runner, engine: str, task: dict, toolbox: Path, out: Path,
@@ -504,8 +661,12 @@ def _suite(runner, tasks: list[dict], toolbox: Path, out: Path,
     for index, task in enumerate(tasks):
         result = _run(runner, "mujoco", task, toolbox, out / f"{index:03d}", script, source_config)
         results.append(result)
+        activity = result.get("action_summary", {})
         progress("source_rollout_complete", trial=index + 1, scheduled=len(tasks),
-                 status=result.get("status"), success=bool(result.get("success")))
+                 status=result.get("status"), success=bool(result.get("success")),
+                 arm_commands=activity.get("arm_commands"),
+                 gripper_commands=activity.get("gripper_commands"),
+                 arm_motion_observed=activity.get("arm_motion_observed"))
     return results
 
 
@@ -514,8 +675,346 @@ def _score(results: list[dict]) -> tuple[int, int]:
         int(result.get("steps") or 0) for result in results)
 
 
+def _source_evidence(result: dict) -> dict:
+    """Executed CaP code is research evidence, never a persistent robot skill.
+
+    Deliberately separate from _public: Stage 2's target boundary is unchanged.
+    These artifacts are only passed to source discovery/repair researchers, not
+    to the fresh one-shot policy writer.
+    """
+    public = _public(result)
+    script = _executed_script(result)
+    execution = {"actual_started": result.get("actual_started") is True,
+                 "script": script, "script_sha256": _digest(script) if script is not None else None}
+    output = result.get("output_dir")
+    if output:
+        response = Path(output) / "policy_response.txt"
+        if response.is_file():
+            match = re.search(r"===PLAN START===\s*(.*?)\s*===PLAN END===", response.read_text(), re.S)
+            if match:
+                execution["plan"] = match.group(1)
+    public["execution"] = execution
+    return public
+
+
+def _predicate_signature(task: dict) -> str:
+    """Group goal structures, independent of poses, thresholds and task names."""
+    def shape(node):
+        if not isinstance(node, dict):
+            return None
+        for operator in ("all", "any"):
+            if operator in node:
+                children = [shape(child) for child in node[operator]]
+                return {operator: sorted(children, key=lambda value: json.dumps(value, sort_keys=True))}
+        return {key: node[key] for key in ("kind", "object") if key in node}
+    return json.dumps(shape(task.get("predicate")), sort_keys=True)
+
+
+def _choose_replay(bank: list[dict], count: int, previous: list[list[str]]) -> list[dict]:
+    """Deterministic, coverage-aware sampling; no goal-specific priority rules."""
+    uses = Counter(key for selected in previous for key in selected)
+    signatures = {record["task_sha256"]: record["predicate_signature"] for record in bank}
+    coverage = Counter(signatures[key] for selected in previous for key in selected if key in signatures)
+    remaining, chosen = list(bank), []
+    while remaining and len(chosen) < count:
+        entry = min(remaining, key=lambda record: (
+            coverage[record["predicate_signature"]], uses[record["task_sha256"]],
+            record["first_success"]["cycle"], record["task_sha256"]))
+        chosen.append(copy.deepcopy(entry))
+        remaining.remove(entry)
+        coverage[entry["predicate_signature"]] += 1
+    return chosen
+
+
+def _remember_successes(bank: list[dict], tasks: list[dict], results: list[dict],
+                        toolbox: Path, cycle: int, phase: str) -> list[dict]:
+    """Preserve successes and latest observations, including pre-edit versions."""
+    records = copy.deepcopy(bank)
+    by_task = {record["task_sha256"]: record for record in records}
+    for index, (task, result) in enumerate(zip(tasks, results)):
+        task_hash = _digest(task)
+        passed = bool(result.get("success")) and result.get("actual_started") is True
+        if not passed and task_hash not in by_task:
+            continue
+        evidence = _source_evidence(result)
+        success = {"cycle": cycle, "phase": phase, "trial": index,
+                   "toolbox_sha256": toolbox_hash(toolbox), "toolbox_path": str(toolbox.resolve()),
+                   "script_sha256": evidence["execution"]["script_sha256"],
+                   "script_path": result.get("script_path"), "output_dir": result.get("output_dir"),
+                   "result_sha256": _digest(result),
+                   "outcome": _outcome_summary(evidence)}
+        if task_hash not in by_task:
+            record = {"schema_version": 1, "task_sha256": task_hash, "task": copy.deepcopy(task),
+                      "predicate_signature": _predicate_signature(task), "first_success": success}
+            records.append(record)
+            by_task[task_hash] = record
+        if passed:
+            by_task[task_hash]["last_success"] = success
+        by_task[task_hash]["latest_observation"] = success
+    return records
+
+
+def _replay_evidence(records: list[dict]) -> list[dict]:
+    """Historical scripts aid diagnosis; _suite still generates fresh policies."""
+    evidence = []
+    for record in records:
+        origin = record["first_success"]
+        result = _json(Path(origin["output_dir"]) / "result.json") if origin.get("output_dir") else None
+        if result is None:
+            raise ResearchError("Historical success evidence missing from capability bank")
+        if _digest(result) != origin["result_sha256"]:
+            raise ResearchError("Historical successful result artifact changed")
+        if toolbox_hash(Path(origin["toolbox_path"])) != origin["toolbox_sha256"]:
+            raise ResearchError("Historical successful toolbox artifact changed")
+        public = _source_evidence(result)
+        if public["execution"]["script_sha256"] != origin["script_sha256"]:
+            raise ResearchError("Historical successful policy artifact changed")
+        evidence.append({"task_sha256": record["task_sha256"], "task": record["task"],
+                         "successful_toolbox_sha256": origin["toolbox_sha256"],
+                         "successful_toolbox": _contents(Path(origin["toolbox_path"])),
+                         "historical_success": public})
+    return evidence
+
+
+def _discovery_regression(current: list[dict], candidate: list[dict], focused: int,
+                          replay: list[dict]) -> dict:
+    focused_ok = _score(candidate[:focused])[0] >= _score(current[:focused])[0]
+    history = [{"task_sha256": record["task_sha256"], "historically_passed": True,
+                "current_success": bool(old.get("success")),
+                "candidate_success": bool(new.get("success")),
+                "baseline_drift": not bool(old.get("success"))}
+               for record, old, new in zip(replay, current[focused:], candidate[focused:])]
+    paired_ok = all(not item["current_success"] or item["candidate_success"] for item in history)
+    unresolved = [item["task_sha256"] for item in history
+                  if not item["current_success"] and not item["candidate_success"]]
+    # Fresh policy variation alone does not prove a code regression. Tied
+    # historical failures require an explicit agent tradeoff, never a silent
+    # reset of the previous success or an impossible all-history-perfect gate.
+    return {"no_regression": focused_ok and paired_ok, "focused_non_decrease": focused_ok,
+            "current_successes": _score(current)[0], "candidate_successes": _score(candidate)[0],
+            "zero_success_comparison": _score(current)[0] == 0 and _score(candidate)[0] == 0,
+            "paired_replays_preserved": paired_ok,
+            "historical_replays_preserved": all(item["candidate_success"] for item in history),
+            "unresolved_historical_tasks": unresolved, "historical_replays": history,
+            "comparison": "fresh_one_shot_policies; historical scripts are diagnostic evidence only"}
+
+
+def _discovery_acceptance(decision: dict, regression: dict) -> dict:
+    unresolved = regression["unresolved_historical_tasks"]
+    reason = decision.get("history_reason")
+    acknowledged = decision.get("accept_unresolved_history") is True and isinstance(reason, str) and bool(reason.strip())
+    gate_reason = None
+    if not regression["no_regression"]:
+        gate_reason = "Focused score decreased or a currently passing replay failed; historical acknowledgement cannot override this guard."
+    elif unresolved and not acknowledged:
+        gate_reason = ("Historical successes failed in both fresh-policy versions. To accept this uncertain tradeoff, "
+                       "return accept_unresolved_history=true and a nonempty history_reason tied to those tasks; "
+                       "otherwise retain the current toolbox. Historical successes remain in the bank.")
+    elif regression.get("zero_success_comparison") and not (
+            isinstance(decision.get("reason"), str) and decision["reason"].strip()):
+        gate_reason = "Both versions have zero successes; reason must describe the hypothesis actually exercised and its observed outcome."
+    return {"accepted": decision.get("accept") is True and gate_reason is None,
+            "demonstrated_improvement": regression.get("candidate_successes", 0) > regression.get("current_successes", 0),
+            "gate_reason": gate_reason, "unresolved_history_acknowledged": acknowledged,
+            "history_reason": reason if isinstance(reason, str) else None}
+
+
+def _history_attempts(attempts: list[dict]) -> list[dict]:
+    """Bound cross-cycle evidence; same-cycle evidence remains complete."""
+    return [{"revision": item["revision"], "hypothesis": item.get("hypothesis"),
+             "accepted": item["accepted"], "reason": item.get("reason"),
+             "demonstrated_improvement": item.get("demonstrated_improvement", False),
+             "gate_reason": item.get("gate_reason"), "history_reason": item.get("history_reason"),
+             "changes": {name: diff[:6000] for name, diff in item.get("changes", {}).items()},
+             "changes_truncated": {name: len(diff) > 6000 for name, diff in item.get("changes", {}).items()},
+             "results": [_outcome_summary(result) for result in item.get("results", [])],
+             "regression": item.get("regression")}
+            for item in attempts[-2:]]
+
+
+def _discover_cycle(runner, agent, run_dir: Path, cfg: dict, index: int, cycle: int,
+                    state: dict, peers: list[dict]) -> dict:
+    root = run_dir / "discovery" / f"member_{index:02d}"
+    current, bank = state["current"], state["bank"]
+    summaries, histories = state["summaries"], state["histories"]
+    probe_toolbox = current
+    _progress(run_dir, "source_cycle_started", member=index, cycle=cycle + 1)
+    cycle_dir = root / f"cycle_{cycle:02d}"
+    peer_path = cycle_dir / "peer_summaries.json"
+    saved_peers = _json(peer_path)
+    if saved_peers is not None and saved_peers != peers:
+        raise ResearchError("Frozen peer summaries changed at cycle boundary")
+    _save(peer_path, peers)
+    probe_response = _ask(agent, cycle_dir / "probe_proposal.json",
+        "discover_probe", f"Generate exactly {cfg['probes']} broad source-only tasks "
+        "to expose missing reusable robot capabilities. Return {tasks:[...]}. "
+        "Match difficulty to demonstrated abilities. If acquisition has not been "
+        "demonstrated, include focused prerequisite experiments with achievable "
+        "object-motion predicates, not mostly complete delivery tasks. Choose the "
+        "tasks yourself; no fixed curriculum is prescribed. " + TASK_SPEC_HELP,
+        {"member": index, "cycle": cycle, "toolbox": _contents(current),
+         **_scene_context(),
+         "own_history": summaries, "recent_research_history": histories[-2:],
+         "peer_experiment_summaries": peers})
+    probes = _tasks_from_response(probe_response, cfg["probes"])
+    probe_variations = _record_scene_variations(probe_response, probes, cycle_dir / "probe_scene_variations.json")
+    _save(cycle_dir / "probe_tasks.json", probes)
+    probe_results = _suite(runner, probes, current, cycle_dir / "probes")
+    probe_evidence = [_source_evidence(result) for result in probe_results]
+    bank = _remember_successes(bank, probes, probe_results, probe_toolbox, cycle, "probe")
+    _save(cycle_dir / "bank_after_probes.json", bank)
+    _save(root / "capability_bank.json", bank)
+    _progress(run_dir, "source_probe_complete", member=index, cycle=cycle + 1,
+              successes=_score(probe_results)[0], scheduled=len(probes))
+    focus = _ask(agent, cycle_dir / "focus_proposal.json", "discover_focus",
+        f"Identify one systematic weakness and return {{weakness:str,tasks:[...]}} "
+        f"with exactly {cfg['focused']} focused source tasks. Inspect executed code/plans "
+        "alongside observations; separate policy-writing errors from reusable-tool failures. "
+        "Check action_summary first: no arm commands means manipulation was not tested. "
+        "Use close/open command counts, minimum TCP height, TCP rise after close, motion "
+        "rejections, termination reason and phase images to distinguish observation-only "
+        "stops, contact attempts, lift attempts and placement failures. These are action "
+        "observations, never proof of grasp success; compare the independent predicate. "
+        "Diagnose unnecessary precondition vetoes and observation recovery before "
+        "attributing such outcomes to friction, payload or grasp mechanics. "
+        "Successful one-shot scripts are diagnostic evidence, not persistent capabilities. " + TASK_SPEC_HELP,
+        {"toolbox": _contents(current), **_scene_context(), "probe_tasks": probes, "probe_results": probe_evidence,
+         "probe_scene_variations": probe_variations,
+         "recent_research_history": histories[-2:]})
+    focused = _tasks_from_response(focus, cfg["focused"])
+    _record_scene_variations(focus, focused, cycle_dir / "focused_scene_variations.json")
+    replay_records = _choose_replay(bank, cfg["replay"], state["replay_history"])
+    replay_path = cycle_dir / "replay_records.json"
+    saved_replay = _json(replay_path)
+    if saved_replay is not None and saved_replay != replay_records:
+        raise ResearchError("Frozen historical replay selection changed")
+    _save(replay_path, replay_records)
+    replay = [record["task"] for record in replay_records]
+    anchors = _replay_evidence(replay_records)
+    _save(cycle_dir / "focused_tasks.json", focused)
+    _save(cycle_dir / "replay_tasks.json", replay)
+    current_results = _suite(runner, focused + replay, current, cycle_dir / "before")
+    bank = _remember_successes(bank, focused + replay, current_results, current, cycle, "focused_baseline")
+    _save(cycle_dir / "bank_after_baseline.json", bank)
+    _save(root / "capability_bank.json", bank)
+    accepted, revision_history = [], []
+    for revision in range(cfg["revisions"]):
+        rev_dir = cycle_dir / f"revision_{revision:02d}"
+        proposal = _ask(agent, rev_dir / "proposal.json", "discover_revision",
+            "Propose reusable improvements for the focused weakness. Return complete "
+            '{"toolbox.py":str,"skill.md":str,"hypothesis":str}. Only these two files '
+            "persist as robot capabilities. Preserve API compatibility. Do not read "
+            "simulator truth or implement direct simulator control. Study successful probe "
+            "scripts as well as failed focused scripts: extract reusable mechanisms instead "
+            "of encoding task poses or persisting one-shot scripts. Use prior_attempts and "
+            "recent_research_history to learn from rejected code, outcomes and reasons. "
+            "Historical replay tasks remain previously solved even if the freshly generated "
+            "current policy fails; preserve those capabilities without claiming that fresh "
+            "policy variation alone proves a toolbox regression. If policies stopped "
+            "before motion, repair executable exploration and overly strict usage "
+            "advice; adding another helper with an impossible caller guard is not "
+            "a remedy. Simulation trials may proceed with bounded uncertainty as "
+            "described in the exploration contract. Use action_summary and phase images "
+            "to identify whether closing, lifting or releasing was actually exercised; "
+            "robot motion alone does not demonstrate object acquisition.",
+            {"weakness": focus.get("weakness"), "toolbox": _contents(current), **_scene_context(),
+             "tasks": focused + replay, "results": [_source_evidence(r) for r in current_results],
+             "probe_examples": [{"task": task, "result": result}
+                                for task, result in zip(probes, probe_evidence)],
+             "probe_toolbox": _contents(probe_toolbox),
+             "probe_toolbox_sha256": toolbox_hash(probe_toolbox),
+             "historical_replay_anchors": anchors, "prior_attempts": revision_history,
+             "recent_research_history": histories[-2:]})
+        candidate, validation = _candidate(proposal, rev_dir)
+        attempt_record = {"revision": revision, "hypothesis": proposal.get("hypothesis"),
+                          "baseline_toolbox_sha256": toolbox_hash(current),
+                          "changes": _changes(current, proposal),
+                          "candidate_toolbox": {name: proposal.get(name) for name in CAPABILITY_FILES},
+                          "validation": validation}
+        if candidate is None:
+            attempt_record.update(accepted=False, reason=validation["reason"], results=[])
+            revision_history.append(attempt_record)
+            _save(rev_dir / "accepted.json", attempt_record)
+            _progress(run_dir, "source_revision_complete", member=index, cycle=cycle + 1,
+                      revision=revision + 1, accepted=False, status="invalid_candidate")
+            continue
+        candidate_results = _suite(runner, focused + replay, candidate, rev_dir / "tests")
+        regression = _discovery_regression(current_results, candidate_results, len(focused), replay_records)
+        no_regression = regression["no_regression"]
+        decision = _ask(agent, rev_dir / "decision.json", "discover_select",
+            'Review the task predicates, implementation diff, executed scripts/plans and source '
+            'evidence; return {"accept":bool,"reason":str,"accept_unresolved_history":bool,"history_reason":str}. '
+            "Accept only a plausible reusable improvement with no focused-score decrease and "
+            "no current-pass to candidate-fail replay regression. If both versions fail a "
+            "historically successful task, acceptance additionally requires accept_unresolved_history=true "
+            "and a nonempty history_reason explaining the specific uncertain tradeoff. Otherwise "
+            "retain current. A fresh current replay failure does not erase a "
+            "historical success. Different one-shot scripts confound causal attribution; "
+            "describe that uncertainty. A tie is not improvement by itself: cite a concrete "
+            "reusable change and behavioral/code evidence. When both versions have zero "
+            "successes, reason must state the hypothesis actually tested, cite the executed "
+            "action/phase evidence and outcome, and explicitly leave capability success "
+            "unverified. Additional helpers or a less restrictive guard alone are not "
+            "demonstrated improvement. Policy stdout may implement a "
+            "different check from the declared task predicate; compare both explicitly. "
+            "For an exploration weakness, require evidence that the candidate's "
+            "observation/manipulation path was actually exercised. If all relevant "
+            "trials still stop before arm motion, retain current and request an "
+            "executable remedy; do not describe unexecuted code as a learned capability.",
+            {"hypothesis": proposal.get("hypothesis"), "no_regression": no_regression,
+             "regression": regression, "tasks": focused + replay, "focused_count": len(focused),
+             "historical_replay_anchors": anchors, "current_toolbox": _contents(current),
+             "candidate_toolbox": _contents(candidate), "changes": attempt_record["changes"],
+             "current": [_source_evidence(r) for r in current_results],
+             "candidate": [_source_evidence(r) for r in candidate_results]})
+        acceptance = _discovery_acceptance(decision, regression)
+        take = acceptance["accepted"]
+        attempt_record.update(accepted=take, agent_accept=decision.get("accept"),
+                              no_regression=no_regression, regression=regression,
+                              reason=decision.get("reason"),
+                              gate_reason=acceptance["gate_reason"],
+                              unresolved_history_acknowledged=acceptance["unresolved_history_acknowledged"],
+                              history_reason=acceptance["history_reason"],
+                              demonstrated_improvement=acceptance["demonstrated_improvement"],
+                              baseline_results=[_source_evidence(r) for r in current_results],
+                              results=[_source_evidence(r) for r in candidate_results])
+        revision_history.append(attempt_record)
+        _save(rev_dir / "accepted.json", attempt_record)
+        if take:
+            current, current_results = candidate, candidate_results
+            accepted.append(proposal.get("hypothesis", ""))
+            bank = _remember_successes(bank, focused + replay, current_results, current, cycle,
+                                       f"accepted_revision_{revision:02d}")
+            _save(rev_dir / "capability_bank.json", bank)
+            _save(root / "capability_bank.json", bank)
+        _progress(run_dir, "source_revision_complete", member=index, cycle=cycle + 1,
+                  revision=revision + 1, accepted=take,
+                  focused_successes=_score(current_results[:len(focused)])[0])
+    summary = {"cycle": cycle, "weakness": focus.get("weakness"),
+               "probe_successes": _score(probe_results)[0],
+               "focused_successes": _score(current_results[:len(focused)])[0],
+               "replay_successes": _score(current_results[len(focused):])[0],
+               "replay_tasks": len(replay), "accepted_hypotheses": accepted,
+               "capability_bank_size": len(bank),
+               "current_version_confirmed_capabilities": sum(
+                   record["latest_observation"]["toolbox_sha256"] == toolbox_hash(current) and
+                   bool(record["latest_observation"]["outcome"]["success"]) for record in bank)}
+    history = {"cycle": cycle, "weakness": focus.get("weakness"),
+               "attempts": _history_attempts(revision_history)}
+    _save(cycle_dir / "summary.json", summary)
+    _save(cycle_dir / "research_history.json", history)
+    _save(cycle_dir / "capability_bank.json", bank)
+    _save(root / "capability_bank.json", bank)
+    _snapshot(current, cycle_dir / "final_toolbox")
+    return {"current": current, "bank": bank, "summaries": summaries + [summary],
+            "histories": histories + [history], "replay_history": state["replay_history"] +
+            [[record["task_sha256"] for record in replay_records]]}
+
+
 def discover(runner, agent, run_dir: Path, config: dict) -> dict:
-    """Run independent source curricula and select without target access."""
+    """Independent curricula, interleaved at cycle boundaries, without target access."""
+    if callable(getattr(agent, "set_phase", None)):
+        agent.set_phase("stage1")
     run_dir = Path(run_dir).resolve()
     with _lock(run_dir):
         cfg = _initialize(run_dir, config)
@@ -524,132 +1023,77 @@ def discover(runner, agent, run_dir: Path, config: dict) -> dict:
             _check_frozen(run_dir / "frozen" / "stage1")
             return done
         _progress(run_dir, "discovery_started", population=cfg["population"], cycles=cfg["cycles"])
+        states = [{"current": _snapshot(run_dir / "frozen" / "initial",
+                                        run_dir / "discovery" / f"member_{index:02d}" / "initial"),
+                   "bank": [], "summaries": [], "histories": [], "replay_history": []}
+                  for index in range(cfg["population"])]
+        for cycle in range(cfg["cycles"]):
+            # All peers use the same previous-cycle boundary. Reconstructing in
+            # this order on resume cannot expose a later member/cycle summary.
+            boundary = [copy.deepcopy(state["summaries"]) for state in states]
+            for index in range(cfg["population"]):
+                peers = [{"member": peer, "summaries": summaries[-2:]}
+                         for peer, summaries in enumerate(boundary) if peer != index and summaries]
+                states[index] = _discover_cycle(runner, agent, run_dir, cfg, index, cycle, states[index], peers)
         members = []
-        for index in range(cfg["population"]):
-            root = run_dir / "discovery" / f"member_{index:02d}"
-            current = _snapshot(run_dir / "frozen" / "initial", root / "initial")
-            bank: list[dict] = []
-            summaries = []
-            for cycle in range(cfg["cycles"]):
-                _progress(run_dir, "source_cycle_started", member=index, cycle=cycle + 1)
-                cycle_dir = root / f"cycle_{cycle:02d}"
-                # Freeze exactly the available peer summaries at this boundary.
-                peer_path = cycle_dir / "peer_summaries.json"
-                peers = _json(peer_path)
-                if peers is None:
-                    peers = [{"member": prior["member"], "summaries": prior["summaries"]}
-                             for prior in members]
-                    _save(peer_path, peers)
-                probes = _tasks_from_response(_ask(agent, cycle_dir / "probe_proposal.json",
-                    "discover_probe", f"Generate exactly {cfg['probes']} broad source-only tasks "
-                    "to expose missing reusable robot capabilities. Return {tasks:[...]}. " + TASK_SPEC_HELP,
-                    {"member": index, "cycle": cycle, "toolbox": _contents(current),
-                     "source_scene_template": make_task(TASK_IDS[0], 0)["scene"],
-                     "own_history": summaries, "peer_experiment_summaries": peers}), cfg["probes"])
-                _save(cycle_dir / "probe_tasks.json", probes)
-                probe_results = _suite(runner, probes, current, cycle_dir / "probes")
-                _progress(run_dir, "source_probe_complete", member=index, cycle=cycle + 1,
-                          successes=_score(probe_results)[0], scheduled=len(probes))
-                focus = _ask(agent, cycle_dir / "focus_proposal.json", "discover_focus",
-                    f"Identify one systematic weakness and return {{weakness:str,tasks:[...]}} "
-                    f"with exactly {cfg['focused']} focused source tasks. " + TASK_SPEC_HELP,
-                    {"toolbox": _contents(current), "probe_tasks": probes,
-                     "probe_results": [_public(result) for result in probe_results]})
-                focused = _tasks_from_response(focus, cfg["focused"])
-                replay = bank[-cfg["replay"]:] if cfg["replay"] else []
-                _save(cycle_dir / "focused_tasks.json", focused)
-                _save(cycle_dir / "replay_tasks.json", replay)
-                current_results = _suite(runner, focused + replay, current, cycle_dir / "before")
-                accepted = []
-                revision_history = []
-                for revision in range(cfg["revisions"]):
-                    rev_dir = cycle_dir / f"revision_{revision:02d}"
-                    proposal = _ask(agent, rev_dir / "proposal.json", "discover_revision",
-                        "Propose reusable improvements for the focused weakness. Return complete "
-                        '{"toolbox.py":str,"skill.md":str,"hypothesis":str}. Only these two files '
-                        "persist as robot capabilities. Preserve API compatibility. Do not read "
-                        "simulator truth or implement direct simulator control. Use prior_attempts "
-                        "to learn from rejected code, outcomes and rejection reasons.",
-                        {"weakness": focus.get("weakness"), "toolbox": _contents(current),
-                         "tasks": focused + replay, "results": [_public(r) for r in current_results],
-                         "prior_attempts": revision_history})
-                    candidate, validation = _candidate(proposal, rev_dir)
-                    attempt_record = {"revision": revision, "hypothesis": proposal.get("hypothesis"),
-                                      "changes": _changes(current, proposal),
-                                      "candidate_toolbox": {name: proposal.get(name) for name in CAPABILITY_FILES},
-                                      "validation": validation}
-                    if candidate is None:
-                        attempt_record.update(accepted=False, reason=validation["reason"], results=[])
-                        revision_history.append(attempt_record)
-                        _save(rev_dir / "accepted.json", attempt_record)
-                        _progress(run_dir, "source_revision_complete", member=index, cycle=cycle + 1,
-                                  revision=revision + 1, accepted=False, status="invalid_candidate")
-                        continue
-                    candidate_results = _suite(runner, focused + replay, candidate, rev_dir / "tests")
-                    no_regression = (_score(candidate_results[:len(focused)])[0] >=
-                                     _score(current_results[:len(focused)])[0] and
-                                     all(not old.get("success") or new.get("success")
-                                         for old, new in zip(current_results[len(focused):],
-                                                             candidate_results[len(focused):])))
-                    decision = _ask(agent, rev_dir / "decision.json", "discover_select",
-                        'Review source evidence and return {"accept":bool,"reason":str}. '
-                        "Accept only a plausible reusable improvement with no focused-score "
-                        "decrease and no failure of a previously passing capability replay.",
-                        {"hypothesis": proposal.get("hypothesis"), "no_regression": no_regression,
-                         "current": [_public(r) for r in current_results],
-                         "candidate": [_public(r) for r in candidate_results]})
-                    take = decision.get("accept") is True and no_regression
-                    attempt_record.update(accepted=take, agent_accept=decision.get("accept"),
-                                          no_regression=no_regression, reason=decision.get("reason"),
-                                          baseline_results=[_public(r) for r in current_results],
-                                          results=[_public(r) for r in candidate_results])
-                    revision_history.append(attempt_record)
-                    _save(rev_dir / "accepted.json", attempt_record)
-                    if take:
-                        current, current_results = candidate, candidate_results
-                        accepted.append(proposal.get("hypothesis", ""))
-                    _progress(run_dir, "source_revision_complete", member=index, cycle=cycle + 1,
-                              revision=revision + 1, accepted=take,
-                              focused_successes=_score(current_results[:len(focused)])[0])
-                for task, result in zip(probes + focused + replay, probe_results + current_results):
-                    if result.get("success") and _digest(task) not in {_digest(t) for t in bank}:
-                        bank.append(task)
-                summary = {"cycle": cycle, "weakness": focus.get("weakness"),
-                           "probe_successes": _score(probe_results)[0],
-                           "focused_successes": _score(current_results[:len(focused)])[0],
-                           "accepted_hypotheses": accepted, "capability_bank_size": len(bank)}
-                summaries.append(summary)
-                _save(cycle_dir / "summary.json", summary)
-                _save(root / "capability_bank.json", bank)
-                _snapshot(current, cycle_dir / "final_toolbox")
-            frozen = _freeze(current, root / "frozen")
-            members.append({"member": index, "toolbox": str(frozen), "summaries": summaries})
+        for index, state in enumerate(states):
+            frozen = _freeze(state["current"], run_dir / "discovery" / f"member_{index:02d}" / "frozen")
+            members.append({"member": index, "toolbox": str(frozen), "summaries": state["summaries"]})
         selection = _json(run_dir / "selection_tasks.json")
-        manifest = _json(run_dir / "manifest.json")
-        if _digest(selection) != manifest["selection_sha256"]:
-            raise ResearchError("Frozen source selection tasks were modified")
+        auxiliary = _json(run_dir / "auxiliary_selection_tasks.json")
+        _check_selection_sets(run_dir, _json(run_dir / "manifest.json"))
         for member in members:
             _progress(run_dir, "source_selection_started", member=member["member"], scenes=len(selection))
             scores = _suite(runner, selection, Path(member["toolbox"]),
                             run_dir / "selection" / f"member_{member['member']:02d}")
+            auxiliary_scores = _suite(runner, auxiliary, Path(member["toolbox"]),
+                                      run_dir / "auxiliary_selection" / f"member_{member['member']:02d}")
             member["successes"], member["steps"] = _score(scores)
+            member["auxiliary_successes"] = _score(auxiliary_scores)[0]
             valid = [result for result in scores if result.get("status") in ("success", "failed")
                      and result.get("actual_started") is True]
             member["valid_executions"] = len(valid)
+            member["selection_valid_executions"] = len(valid) + sum(
+                result.get("status") in ("success", "failed") and result.get("actual_started") is True
+                for result in auxiliary_scores)
+            # Kept as a diagnostic only: fast failure is not a selection advantage.
             member["mean_valid_steps"] = sum(int(result.get("steps") or 0) for result in valid) / len(valid) \
                 if valid else None
+            member["selection_results"] = [_selection_record(task, result, trial)
+                for trial, (task, result) in enumerate(zip(selection, scores))]
+            member["auxiliary_results"] = [_selection_record(task, result, trial)
+                for trial, (task, result) in enumerate(zip(auxiliary, auxiliary_scores))]
+            member["capability_bank_size"] = len(states[member["member"]]["bank"])
         eligible = [member for member in members if member["valid_executions"] > 0]
         if not eligible:
             raise ResearchError("No source selection trial completed a valid physics policy; "
                                 "discovery is not complete and target adaptation must not start")
-        winner = min(eligible, key=lambda item: (-item["successes"], -item["valid_executions"],
-                                               item["mean_valid_steps"], item["member"]))
+        winner = min(eligible, key=lambda item: (-item["successes"], -item["auxiliary_successes"],
+                                               -item["selection_valid_executions"], item["member"]))
         destination = _freeze(Path(winner["toolbox"]), run_dir / "frozen" / "stage1")
         result = {"winner": winner["member"], "toolbox": str(destination), "members": members,
-                  "selection_tasks": len(selection), "agent_count": getattr(agent, "count", None)}
+                  "process_complete": True, "full_task_successes": winner["successes"],
+                  "full_task_verified": winner["successes"] > 0,
+                  "auxiliary_successes": winner["auxiliary_successes"],
+                  "capability_bank_size": winner["capability_bank_size"],
+                  "selection_tasks": len(selection), "auxiliary_selection_tasks": len(auxiliary),
+                  "selection_rule": "full_successes, auxiliary_successes, valid_executions, member_index",
+                  "agent_count": getattr(agent, "count", None),
+                  "agent_count_note": "Cumulative recorded calls at Stage 1 completion, before adaptation/evaluation."}
         _save(run_dir / "discovery.json", result)
-        _progress(run_dir, "discovery_complete", winner=winner["member"], successes=winner["successes"])
+        _progress(run_dir, "discovery_complete", winner=winner["member"],
+                  full_task_successes=winner["successes"], auxiliary_successes=winner["auxiliary_successes"],
+                  full_task_verified=result["full_task_verified"])
         return result
+
+
+def _selection_record(task: dict, result: dict, trial: int) -> dict:
+    evidence = _public(result)["evidence"]
+    return {"trial": trial, "task": task["name"], "task_sha256": _digest(task),
+            "seed": task["scene"].get("seed"), "success": bool(result.get("success")),
+            "status": result.get("status"), "actual_started": result.get("actual_started"),
+            "output_dir": result.get("output_dir"), "video": evidence.get("video"),
+            "phase_images": evidence.get("phase_images", []), "reason": evidence.get("reason")}
 
 
 def _calibration(value: dict) -> dict:
@@ -693,6 +1137,8 @@ def _source_reconstruction(task_id: str, public_evidence: dict) -> dict:
 
 def adapt(runner, agent, run_dir: Path, config: dict) -> dict:
     """Adapt each task independently; target slots are never a repair score search."""
+    if callable(getattr(agent, "set_phase", None)):
+        agent.set_phase("stage2")
     run_dir = Path(run_dir).resolve()
     with _lock(run_dir):
         cfg = _initialize(run_dir, config)
@@ -798,6 +1244,7 @@ def adapt(runner, agent, run_dir: Path, config: dict) -> dict:
                      "suggested_source_seeds": [cfg["seed"] + 40000 + task_index * 1000 +
                          trial * 100 + j for j in range(cfg["screen_tasks"])]})
                 generalization = _tasks_from_response(screen_proposal, cfg["screen_tasks"])
+                _record_scene_variations(screen_proposal, generalization, trial_dir / "screen_scene_variations.json")
                 if nominal_task.get("predicate") is not None and any(
                     task.get("predicate") != nominal_task["predicate"] for task in generalization
                 ):
@@ -819,6 +1266,9 @@ def adapt(runner, agent, run_dir: Path, config: dict) -> dict:
                     "target mismatch and robustness; you may reject a high-scoring implausible repair.",
                     {"hypotheses": hypothesis_map, "candidates": candidate_records,
                      "available_choices": list(candidates), "task_history": trial_summaries,
+                     "source_task": nominal_task, "fixed_script": fixed_script,
+                     "generalization_tasks": generalization,
+                     "toolboxes": {key: _contents(value) for key, value in candidates.items()},
                      "target": _public(target), "source_config": source_config, "screen": evidence})
                 choice = selected.get("selected")
                 selection_error = None
@@ -858,6 +1308,8 @@ def adapt(runner, agent, run_dir: Path, config: dict) -> dict:
 
 def evaluate(runner, agent, run_dir: Path, config: dict) -> dict:
     """Fresh policy scripts, frozen capabilities, matched scene seeds, no feedback."""
+    if callable(getattr(agent, "set_phase", None)):
+        agent.set_phase("evaluation")
     run_dir = Path(run_dir).resolve()
     with _lock(run_dir):
         cfg = _initialize(run_dir, config)
@@ -893,6 +1345,39 @@ def evaluate(runner, agent, run_dir: Path, config: dict) -> dict:
         return result
 
 
+def _stage1_report(run_dir: Path, manifest: dict, calls: int) -> dict:
+    discovery = _json(run_dir / "discovery.json", {})
+    tasks = _json(run_dir / "selection_tasks.json", [])
+    auxiliary = _json(run_dir / "auxiliary_selection_tasks.json", [])
+    members = []
+    for index in range(manifest.get("config", {}).get("population", DEFAULTS["population"])):
+        member = {"member": index}
+        for label, suite, frozen in (("selection_results", "selection", tasks),
+                                     ("auxiliary_results", "auxiliary_selection", auxiliary)):
+            records = []
+            for trial, task in enumerate(frozen):
+                out = run_dir / suite / f"member_{index:02d}" / f"{trial:03d}"
+                outcome = _json(out / "result.json")
+                records.append(_selection_record(task, outcome or {"status": "pending", "output_dir": str(out)}, trial))
+            member[label] = records
+        member["full_task_successes"] = sum(record["success"] for record in member["selection_results"])
+        member["auxiliary_successes"] = sum(record["success"] for record in member["auxiliary_results"])
+        bank = _json(run_dir / "discovery" / f"member_{index:02d}" / "capability_bank.json", [])
+        member["capability_bank_size"] = len(bank)
+        members.append(member)
+    winner = discovery.get("winner")
+    selected = next((member for member in members if member["member"] == winner), None)
+    full = selected["full_task_successes"] if selected else 0
+    return {"process_complete": bool(discovery), "winner": winner,
+            "full_task_verified": bool(discovery) and full > 0, "full_task_successes": full,
+            "auxiliary_successes": selected["auxiliary_successes"] if selected else None,
+            "capability_bank_size": selected["capability_bank_size"] if selected else None,
+            "selection_tasks_per_member": len(tasks), "auxiliary_tasks_per_member": len(auxiliary),
+            "agent_calls": discovery.get("agent_count", calls),
+            "agent_calls_note": "Cumulative calls at Stage 1 completion; later phases excluded.",
+            "members": members}
+
+
 def report(run_dir: Path) -> dict:
     """Write an honest partial-or-complete report without optimizer feedback."""
     run_dir = Path(run_dir).resolve()
@@ -913,10 +1398,14 @@ def report(run_dir: Path) -> dict:
                          "success_rate": successes / len(relevant) if len(completed) == len(relevant)
                          and relevant else None})
     adaptations = _json(run_dir / "adaptation.json", {}).get("tasks", {})
-    decisions = 0
+    decisions, evidence_turns = 0, 0
     for path in run_dir.rglob("*.json"):
         record = _json(path)
-        decisions += isinstance(record, dict) and "request_sha256" in record
+        if isinstance(record, dict) and "request_sha256" in record:
+            if path.parent.suffix == ".context":
+                evidence_turns += 1
+            else:
+                decisions += 1
     calls = list((run_dir / "agent_calls").glob("*/request.json"))
     usage = {"input_tokens": 0, "cached_input_tokens": 0, "output_tokens": 0}
     models = set()
@@ -945,6 +1434,7 @@ def report(run_dir: Path) -> dict:
         traces[task_id] = task_trials
     source_statuses = Counter()
     source_attempt_statuses = Counter()
+    source_activity = Counter()
     source_valid = 0
     for path in run_dir.rglob("research_request.json"):
         request = _json(path)
@@ -955,6 +1445,9 @@ def report(run_dir: Path) -> dict:
             source_statuses["missing_result"] += 1
             continue
         source_statuses[outcome.get("status", "unknown")] += 1
+        from .evidence import action_summary
+        activity = outcome.get('action_summary') or action_summary(outcome.get('public_evidence', {}))
+        source_activity[activity['classification']] += 1
         source_valid += outcome.get("status") in ("success", "failed", "completed") and bool(
             outcome.get("actual_started", True))
         attempts = list((path.parent / "research_attempts").glob("*.json"))
@@ -981,21 +1474,41 @@ def report(run_dir: Path) -> dict:
               "engineering_evidence_complete": engineering_evidence_complete,
               "complete": protocol_complete and engineering_evidence_complete,
               "source_rollout_statuses": dict(source_statuses),
+              "source_rollout_activity": dict(source_activity),
               "source_attempt_statuses": dict(source_attempt_statuses),
               "source_valid_physics_rollouts": source_valid,
               "target_rollout_statuses": dict(target_statuses),
               "agent_calls": len(calls) if calls else decisions,
-              "research_decisions": decisions, "token_usage": usage, "models": sorted(models),
+              "research_decisions": decisions, "research_dialogue_turns": evidence_turns,
+              "token_usage": usage, "models": sorted(models),
               "adaptation_trace": traces, "source_target_success_disagreements": mismatch_count}
+    result["stage1"] = _stage1_report(run_dir, manifest, result["agent_calls"])
     result["agent_calls_note"] = "All recorded model calls; token totals only include provider-reported usage."
     _save(run_dir / "report.json", result)
+    stage1 = result["stage1"]
     text = ["# SimEX 本地初步复现报告", "",
-            f"目标仿真：已完成 {result['target_completed']} / {result['target_scheduled']} 个排定试验。",
+            "Stage 1 流程：" + ("已完成。" if stage1["process_complete"] else "未完成。"),
+            f"Stage 1 所选成员：{stage1['winner']}；完整入箱成功 {stage1['full_task_successes']} / "
+            f"{stage1['selection_tasks_per_member']}；共同基础能力选择任务成功 "
+            f"{stage1['auxiliary_successes']} / {stage1['auxiliary_tasks_per_member']}。",
+            f"截至 Stage 1 的累计模型调用：{stage1['agent_calls']}；所选成员历史成功任务数："
+            f"{stage1['capability_bank_size']}。历史成功任务包含自生成子任务，不能等同于完整入箱。",
+            "Stage 1 已出现独立完整入箱成功。" if stage1["full_task_verified"] else "尚未验证完整入箱能力。",
+            "", "| 成员 | 类型 | 场景/种子 | 状态 | 成功 | 视频/记录 |",
+            "|---:|---|---|---|---|---|"]
+    for member in stage1["members"]:
+        for label, kind in (("selection_results", "完整入箱"), ("auxiliary_results", "基础能力")):
+            for record in member[label]:
+                video = record.get("video")
+                artifact = f"[视频]({video})" if video else f"[记录]({record['output_dir']})"
+                text.append(f"| {member['member']} | {kind} | {record['task']} / {record['seed']} | "
+                            f"{record['status']} | {'是' if record['success'] else '否'} | {artifact} |")
+    text.extend(["", f"目标仿真：已完成 {result['target_completed']} / {result['target_scheduled']} 个排定试验。",
             "结果状态：" + ("流程及物理执行证据完整。" if result["complete"] else
                            "预算已执行完，但有效物理执行证据不足，不能判定工程验收完整。"
                            if protocol_complete else "未完成；不把缺失试验计为实测失败。"), "",
             "| 方法 | 任务 | 成功/排定 | 已完成 | 成功率 |",
-            "|---|---|---:|---:|---:|"]
+            "|---|---|---:|---:|---:|"])
     for row in rows:
         rate = "未完成" if row["success_rate"] is None else f"{row['success_rate']:.1%}"
         text.append(f"| {row['method']} | {row['task_id']} | {row['successes']}/{row['scheduled']} | "
@@ -1009,8 +1522,12 @@ def report(run_dir: Path) -> dict:
                  "执行中的基础设施中断锁定原试验、保持未完成，不作为普通失败计入成功率，也不自动重跑。"
                  "需要恢复原始有效结果，或另建独立研究运行，不能以重试筛选成功。"])
     text.extend(["", f"记录模型调用 {result['agent_calls']} 次；代理报告 token 用量：{usage}。",
+                 f"已保存研究决策 {decisions} 次、证据对话轮次 {evidence_turns} 次。读取证据和研究调用的"
+                 "有限连接重试均计入模型调用预算，不增加物理试验次数。",
                  f"源仿真最终状态计数：{dict(source_statuses)}；含重启前基础设施失败的尝试计数："
                  f"{dict(source_attempt_statuses)}。有效源物理执行 {source_valid} 次。",
+                 f"源试验动作分类：{dict(source_activity)}。no_arm_commands 表示没有发出机械臂"
+                 "运动指令；等待或仅开合夹爪不代表尝试了抓取。动作发生也不等于抓取成功。",
                  f"目标试验状态计数：{dict(target_statuses)}。非法策略、生成失败和基础设施失败"
                  "单独列出，不能用它们证明抓取方法或模拟器链路已经有效运行。",
                  f"初始固定脚本重放与目标成功判定不同的试验：{mismatch_count} 次。"

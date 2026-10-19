@@ -7,7 +7,7 @@ from pathlib import Path
 import time
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--run', type=Path, default=Path('runs/small_v2'))
+parser.add_argument('--run', type=Path, default=Path('runs/small_v6'))
 args = parser.parse_args()
 root = args.run
 progress = root / 'progress.jsonl'
@@ -29,19 +29,31 @@ unfinished = []
 for request in sorted(calls):
     if not (request.parent / 'result.json').exists():
         data = json.loads(request.read_text())
-        item = {'call': request.parent.name, 'seconds': round(time.time()-data['started_at'])}
+        item = {'call': request.parent.name, 'seconds': round(time.time()-data['started_at']),
+                'prompt_chars': data.get('prompt_chars', len(data.get('prompt', ''))),
+                'image_count': data.get('image_count', len(data.get('images', [])))}
         (active if process['state'] == 'running' else unfinished).append(item)
 ledger = root / 'target_ledger.json'
 slots = list(json.loads(ledger.read_text())['slots'].values()) if ledger.exists() else []
+discovery_path = root / 'discovery.json'
+discovery = json.loads(discovery_path.read_text()) if discovery_path.exists() else {}
+stage1 = {key: discovery[key] for key in ('process_complete', 'winner', 'full_task_successes',
+          'full_task_verified', 'auxiliary_successes', 'agent_count') if key in discovery}
+if discovery and discovery.get('full_task_verified') is False:
+    stage1['message'] = '尚未验证完整入箱能力'
 outcomes = Counter()
+activity = Counter()
 for path in root.rglob('result.json'):
     if '/agent_calls/' in str(path) or '/diagnostics/' in str(path):
         continue
     value = json.loads(path.read_text())
     if 'actual_started' in value:
         outcomes[value['status']] += 1
+        activity[value.get('action_summary', {}).get('classification', 'unavailable')] += 1
 print(json.dumps({'run': str(root), 'process': process,
                   'latest_events': [json.loads(x) for x in events[-3:]],
                   'model_calls': len(calls), 'active_calls': active, 'unfinished_calls': unfinished,
+                  'stage1': stage1,
                   'target_slots': dict(Counter(x['state'] for x in slots)),
-                  'rollout_statuses': dict(outcomes)}, indent=2, ensure_ascii=False))
+                  'rollout_statuses': dict(outcomes),
+                  'rollout_activity': dict(activity)}, indent=2, ensure_ascii=False))

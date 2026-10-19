@@ -139,7 +139,10 @@ class Recorder:
             if len(self.errors) < 5:
                 self.errors.append(f'Action evidence: {exc}')
 
-    def action_end(self, action, error=None):
+    def action_end(self, action, error=None, result=None):
+        from .evidence import public_action_result
+        if result is not None:
+            action['result'] = public_action_result(result)
         if error is not None:
             action['error'] = 'Backend action interrupted'
         try:
@@ -224,7 +227,7 @@ def main():
                     raise
                 else:
                     if action is not None:
-                        recorder.action_end(action)
+                        recorder.action_end(action, result=result)
                 if method == 'observe' and recorder:
                     recorder.observation(result)
             else:

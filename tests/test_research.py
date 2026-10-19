@@ -394,3 +394,77 @@ def test_prepared_policy_can_execute_when_last_model_call_used_budget(harness):
 def test_source_calibration_rejects_unbounded_or_unsupported_parameters(value):
     with pytest.raises(research.ResearchError):
         research._calibration(value)
+
+
+@pytest.mark.parametrize('full_success,auxiliary_success,expected', [
+    (None, 1, 1), (0, 1, 0), (None, None, 0),
+])
+def test_selection_ranks_full_then_common_auxiliary_and_never_fast_failure(
+        harness, full_success, auxiliary_success, expected):
+    runner, agent, run = harness
+    original = runner.rollout
+    def rollout(**kwargs):
+        result = original(**kwargs)
+        parts = kwargs['out'].parts
+        member = 0 if 'member_00' in parts else 1
+        passed = ('selection' in parts and member == full_success or
+                  'auxiliary_selection' in parts and member == auxiliary_success)
+        result.update(success=passed, status='success' if passed else 'failed',
+                      steps=500 if member == 0 else 1)
+        return result
+    runner.rollout = rollout
+    result = research.discover(runner, agent, run, SMALL)
+    assert result['winner'] == expected
+    assert result['process_complete']
+    assert result['full_task_verified'] is (full_success is not None)
+    common = research._json(run / 'auxiliary_selection_tasks.json')
+    assert [(t['predicate']['all'][0]['kind'], t['predicate']['all'][0]['min']) for t in common] == [
+        ('lift', .05), ('lift', .05), ('displaced', .03), ('displaced', .03)]
+    auxiliary_calls = [call for call in runner.calls if 'auxiliary_selection' in call['out'].parts]
+    assert [call['task'] for call in auxiliary_calls[:4]] == [call['task'] for call in auxiliary_calls[4:]]
+    assert all(call['generated'] for call in auxiliary_calls)
+    last_discovery = max(i for i, call in enumerate(runner.calls) if 'discovery' in call['out'].parts)
+    assert all(i > last_discovery for i, call in enumerate(runner.calls) if 'auxiliary_selection' in call['out'].parts)
+    assert all('selection_lift_' not in json.dumps(payload) for _, payload, _ in agent.calls)
+
+
+def test_frozen_auxiliary_schedule_tampering_rejected_even_after_completion(harness):
+    runner, agent, run = harness
+    research.discover(runner, agent, run, SMALL)
+    path = run / 'auxiliary_selection_tasks.json'
+    tasks = research._json(path)
+    tasks[0]['predicate']['all'][0]['min'] = .001
+    research._save(path, tasks)
+    with pytest.raises(research.ResearchError, match='selection tasks were modified'):
+        research.discover(runner, agent, run, SMALL)
+
+
+def test_stage1_report_shows_all_nine_trials_and_keeps_stage1_call_count(harness):
+    runner, agent, run = harness
+    original = runner.rollout
+    def rollout(**kwargs):
+        result = original(**kwargs)
+        result['public_evidence']['video'] = str(kwargs['out'] / 'public.mp4')
+        return result
+    runner.rollout = rollout
+    discovery = research.discover(runner, agent, run, {**SMALL, 'selection_trials': 3})
+    saved_count = discovery['agent_count']
+    agent.count += 100
+    result = research.report(run)['stage1']
+    assert result['process_complete'] and not result['full_task_verified']
+    assert result['agent_calls'] == saved_count
+    assert len(result['members']) == 2
+    assert all(len(member['selection_results']) == 9 for member in result['members'])
+    assert all(record['video'].endswith('public.mp4') for member in result['members']
+               for record in member['selection_results'])
+    assert '尚未验证完整入箱能力' in (run / 'report.md').read_text()
+
+
+def test_old_protocol_manifest_requires_new_run(harness):
+    _, _, run = harness
+    research._initialize(run, SMALL)
+    manifest = research._json(run / 'manifest.json')
+    manifest['format_version'] = 2
+    research._save(run / 'manifest.json', manifest)
+    with pytest.raises(research.ResearchError, match='create a new run'):
+        research._initialize(run, SMALL)

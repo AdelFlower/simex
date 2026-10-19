@@ -8,9 +8,13 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from .contracts import CAPABILITY_GUIDANCE
+from .research_context import MAX_IMAGES, MAX_PROMPT_CHARS, RESEARCH_ROLES
 from .storage import atomic_json, digest
 
 ROOT = Path(__file__).resolve().parents[1]
+PHASES = ('manual', 'stage1', 'stage2', 'evaluation')
+REASONING_LEVELS = ('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
 
 
 class AgentError(RuntimeError):
@@ -19,6 +23,10 @@ class AgentError(RuntimeError):
 
 class InvalidPolicy(AgentError):
     pass
+
+
+class AgentTransportError(AgentError):
+    """No completed answer: only research decisions may retry this failure."""
 
 
 def _save_events(call_dir, stdout, stderr):
@@ -53,14 +61,57 @@ class Agent:
         self.codex = str(local_codex) if local_codex.exists() else shutil.which('codex')
         if not self.codex or not shutil.which('bwrap'):
             raise AgentError('codex and bubblewrap are required')
+        config_path = Path.home() / '.codex/config.toml'
+        local_config = config_path.read_text() if config_path.exists() else ''
         model = self.config.get('model')
         if not model:
-            config_path = Path.home() / '.codex/config.toml'
-            m = re.search(r'^model\s*=\s*"([^"]+)"', config_path.read_text(), re.M) if config_path.exists() else None
+            m = re.search(r'^model\s*=\s*"([^"]+)"', local_config, re.M)
             model = m.group(1) if m else None
         self.model = model
+        effort_match = re.search(r'^model_reasoning_effort\s*=\s*"([^"]+)"', local_config, re.M)
+        self.config['reasoning_effort'] = self.config.get('reasoning_effort') or (
+            effort_match.group(1) if effort_match else 'medium')
+        self.config['agent_timeout'] = self.config.get('agent_timeout', 600)
+        for phase in PHASES[1:]:
+            for suffix, fallback in [('reasoning_effort', 'reasoning_effort'), ('agent_timeout', 'agent_timeout')]:
+                key = phase + '_' + suffix
+                if self.config.get(key) is None:
+                    self.config[key] = self.config[fallback]
+        for phase in PHASES:
+            prefix = '' if phase == 'manual' else phase + '_'
+            effort = self.config[prefix + 'reasoning_effort']
+            timeout = self.config[prefix + 'agent_timeout']
+            if effort not in REASONING_LEVELS:
+                raise AgentError(f'Invalid text-only reasoning effort for {phase}: {effort}; '
+                                 'delegating modes are incompatible with one-shot policy calls')
+            if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < timeout < float('inf'):
+                raise AgentError(f'{prefix}agent_timeout must be positive and finite')
+        self.phase = 'manual'
+
+    def set_phase(self, phase):
+        """Research phases are serial; their independent policy calls may be parallel."""
+        if phase not in PHASES:
+            raise AgentError(f'Unknown research phase: {phase}')
+        self.phase = phase
+
+    def generation_settings(self):
+        prefix = '' if self.phase == 'manual' else self.phase + '_'
+        return {'model': self.model, 'phase': self.phase,
+                'reasoning_effort': self.config[prefix + 'reasoning_effort'],
+                'agent_timeout': self.config[prefix + 'agent_timeout']}
 
     def _call(self, role, prompt, images=None):
+        settings = self.generation_settings()
+        instruction = ('You are a robotics research text generator. This is one text-only model call. '
+                       'Use only the supplied context. Do not use CLI tools, inspect files, or execute commands. '
+                       'Do not ask the user questions. Follow the requested output format exactly.\n\n')
+        if role == 'policy':
+            instruction = ('You are a robotics research text generator. This is one text-only model call. '
+                           'All evidence is included below. Do not use tools, inspect files, or execute commands. '
+                           'Do not ask questions. Follow the requested output format exactly.\n\n')
+        input_chars = len(instruction + prompt)
+        if role in RESEARCH_ROLES and (input_chars > MAX_PROMPT_CHARS or len(images or []) > MAX_IMAGES):
+            raise AgentError('Research input exceeds the bounded context contract; no model call was made')
         with self._count_lock:
             if self.count >= int(self.config.get('max_agent_calls', 800)):
                 raise AgentError('Configured model-call budget exhausted; checkpoint retained')
@@ -68,8 +119,10 @@ class Agent:
             call_index = self.count
         call_dir = self.calls_dir / f'{call_index:05d}_{role}'
         call_dir.mkdir(parents=True, exist_ok=True)
-        atomic_json(call_dir / 'request.json', dict(role=role, prompt=prompt, model=self.model,
-                    images=images or [], started_at=time.time()))
+        atomic_json(call_dir / 'request.json', dict(role=role, prompt=prompt, **settings,
+                    images=images or [], started_at=time.time(), prompt_chars=len(prompt),
+                    input_chars=input_chars, input_bytes=len((instruction + prompt).encode()),
+                    image_count=len(images or [])))
         # Text-only calls have no tool execution. Temporary mount contains only supplied evidence.
         with tempfile.TemporaryDirectory(prefix='simex-agent-') as temp:
             work = Path(temp)
@@ -104,20 +157,17 @@ class Agent:
                     '--skip-git-repo-check', '--sandbox', 'read-only', '--json',
                     '-C', '/tmp/work', '-o', '/tmp/work/response.txt',
                     '-c', 'web_search="disabled"',
-                    '-c', 'model_reasoning_effort="' + self.config.get('reasoning_effort', 'medium') + '"']
+                    '-c', 'model_reasoning_effort=' + json.dumps(settings['reasoning_effort'])]
             for feature in ('shell_tool', 'unified_exec', 'apps', 'plugins', 'multi_agent',
                             'browser_use', 'computer_use', 'image_generation', 'hooks', 'memories'):
                 cmd += ['--disable', feature]
             if self.model:
                 cmd += ['-m', self.model]
             cmd += image_args + ['-']
-            instruction = ('You are a robotics research text generator. This is one text-only model call. '
-                           'All evidence is included below. Do not use tools, inspect files, or execute commands. '
-                           'Do not ask questions. Follow the requested output format exactly.\n\n')
             started = time.monotonic()
             try:
                 p = subprocess.run(cmd, input=instruction + prompt, text=True, capture_output=True,
-                                   timeout=int(self.config.get('agent_timeout', 600)))
+                                   timeout=settings['agent_timeout'])
             except subprocess.TimeoutExpired as exc:
                 events = _save_events(call_dir, exc.stdout, exc.stderr)
                 response_file = work / 'response.txt'
@@ -126,7 +176,7 @@ class Agent:
                 atomic_json(call_dir / 'result.json', dict(status='timeout', elapsed=time.monotonic()-started,
                             usage=[e['usage'] for e in events if e.get('usage')],
                             usage_complete=False))
-                raise AgentError('Codex call timed out; call is recorded') from exc
+                raise AgentTransportError('Codex call timed out; call is recorded') from exc
             except OSError as exc:
                 atomic_json(call_dir / 'result.json', dict(status='launch_error', reason=str(exc),
                             elapsed=time.monotonic()-started))
@@ -147,6 +197,11 @@ class Agent:
             if prohibited:
                 raise InvalidPolicy('Text-only call used a prohibited tool')
             if p.returncode or not response.strip():
+                network_error = any(e.get('type') == 'error' and any(term in str(e.get('message', '')).lower()
+                    for term in ('stream disconnected', 'websocket', 'connection reset', 'connection closed'))
+                    for e in events)
+                if network_error and not response.strip():
+                    raise AgentTransportError(f'Codex connection failed before an answer; see {call_dir}/events.jsonl')
                 raise AgentError(f'Codex call failed; see {call_dir}/stderr.log')
             return response
 
@@ -177,6 +232,7 @@ class Agent:
                   'Do not use if __name__ blocks or import toolbox. Execute code directly. '
                   'Use dictionary .get(key, default) for optional result fields. '
                   'Only robot public methods; no private transport or simulator access.')
+        prompt += '\n\nFixed task-independent execution guidance:\n' + CAPABILITY_GUIDANCE
         response = self._call('policy', prompt)
         (out / 'policy_response.txt').write_text(response)
         match = re.fullmatch(r'\s*===PLAN START===\s*(.*?)\s*===PLAN END===\s*'

@@ -33,7 +33,7 @@ def make_task(task_id, seed):
         tote = [.425, -.23, 0.0]
         yaw = math.radians(6)
     plate = dict(name='green', position=[*xy.tolist(), .004], radius=.07,
-                 thickness=.006, rim_height=.012, mass=.15,
+                 thickness=.006, rim_height=.012, mass=.03,
                  color=[.1, .75, .15], friction=.6)
     distractor = dict(plate, name='red', position=[.32, .26, .004], color=[.8, .12, .1])
     scene = dict(task_id=task_id, seed=int(seed),

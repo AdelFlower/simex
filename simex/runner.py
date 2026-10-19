@@ -13,7 +13,9 @@ import threading
 import time
 from pathlib import Path
 from .agent import AgentError, InvalidPolicy
+from .contracts import CAPABILITY_GUIDANCE
 from .errors import InfrastructureError, PolicyRequestError
+from .evidence import action_summary
 from .policy_process import validate
 from .scoring import score
 from .storage import atomic_json, digest, toolbox_hash
@@ -185,8 +187,12 @@ class Runner:
         """Generate once per fresh trial, allowing independent source calls in parallel."""
         out = Path(out).resolve()
         out.mkdir(parents=True, exist_ok=True)
+        settings = getattr(self.agent, 'generation_settings', None)
         signature = hashlib.sha256(json.dumps({'name': task['name'], 'description': task['description'],
-                    'toolbox': toolbox_hash(toolbox)}, sort_keys=True).encode()).hexdigest()
+                    'toolbox': toolbox_hash(toolbox),
+                    'execution_guidance': CAPABILITY_GUIDANCE,
+                    'generation_settings': settings() if callable(settings) else {}},
+                    sort_keys=True).encode()).hexdigest()
         path = out / 'policy_generation.json'
         if path.exists():
             result = json.loads(path.read_text())
@@ -379,9 +385,16 @@ class Runner:
         if not reason and status not in ('success', 'failed'):
             reason = stdout[-2000:]
         evidence.update(status=status, success=status == 'success', reason=reason, stdout=stdout)
+        activity = action_summary(evidence)
+        if status == 'failed' and actual_started and not activity['arm_commands']:
+            reason = 'Task predicate failed before any arm command; inspect policy stopping conditions.'
+            evidence['reason'] = reason
+            activity = action_summary(evidence)
+        evidence['action_summary'] = activity
         atomic_json(out / 'public_evidence.json', evidence)
         result = dict(success=status == 'success', status=status, reason=reason,
                       actual_started=actual_started, steps=metrics.get('steps', 0) if metrics else 0,
+                      action_summary=activity,
                       script_path=str(out / 'policy.py') if (out / 'policy.py').exists() else None,
                       public_evidence=evidence, output_dir=str(out), elapsed=time.monotonic()-started,
                       toolbox_hash=toolbox_hash(toolbox))

@@ -13,3 +13,8 @@ build/
 dist/
 .env
 .env.*
+assets/
+tests/*
+!tests/test_cli_diagnostics.py
+!tests/test_initial_geometry.py
+direct_plate/

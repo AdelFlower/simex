@@ -3,8 +3,13 @@
 set -euo pipefail
 PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR"
-RUN_DIR="${1:-runs/small_v2}"
+RUN_DIR="${1:-runs/small_v6}"
 CONFIG_PATH="${2:-configs/small.yaml}"
+RESEARCH_COMMAND="${3:-discover}"
+case "$RESEARCH_COMMAND" in
+    discover|adapt|evaluate|run) ;;
+    *) echo "Command must be discover, adapt, evaluate or run" >&2; exit 1 ;;
+esac
 mkdir -p "$RUN_DIR"
 RUN_DIR="$(cd "$RUN_DIR" && pwd)"
 PID_FILE="$RUN_DIR/research.pid"
@@ -30,16 +35,16 @@ if command -v systemd-run >/dev/null && systemctl --user show-environment >/dev/
         --property=Type=exec --property="WorkingDirectory=$PROJECT_DIR" \
         --property="StandardOutput=append:$RUN_DIR/console.log" \
         --property="StandardError=append:$RUN_DIR/console.log" \
-        "$PROJECT_DIR/.venv/bin/simex" run --run "$RUN_DIR" --config "$CONFIG_PATH"
+        "$PROJECT_DIR/.venv/bin/simex" "$RESEARCH_COMMAND" --run "$RUN_DIR" --config "$CONFIG_PATH"
     RESEARCH_PID="$(systemctl --user show "$SERVICE_NAME" --property=MainPID --value)"
     [[ "$RESEARCH_PID" =~ ^[1-9][0-9]*$ ]] || { echo "Service exited; inspect $RUN_DIR/console.log" >&2; exit 1; }
     printf '%s\n' "$SERVICE_NAME" > "$RUN_DIR/research.service"
 else
-    setsid nohup "$PROJECT_DIR/.venv/bin/simex" run --run "$RUN_DIR" --config "$CONFIG_PATH" \
+    setsid nohup "$PROJECT_DIR/.venv/bin/simex" "$RESEARCH_COMMAND" --run "$RUN_DIR" --config "$CONFIG_PATH" \
         >> "$RUN_DIR/console.log" 2>&1 < /dev/null 9>&- &
     RESEARCH_PID=$!
 fi
 printf '%s\n' "$RESEARCH_PID" > "$PID_FILE.tmp"
 mv "$PID_FILE.tmp" "$PID_FILE"
-echo "Started: PID $RESEARCH_PID; log: $RUN_DIR/console.log"
+echo "Started $RESEARCH_COMMAND: PID $RESEARCH_PID; log: $RUN_DIR/console.log"
 echo "Status: python3 scripts/status.py --run '$RUN_DIR'"

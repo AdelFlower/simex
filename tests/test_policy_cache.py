@@ -38,3 +38,14 @@ def test_invalid_policy_cached_without_silent_resampling(tmp_path):
         result = runner.prepare_policy(task, ROOT / 'simex/initial', tmp_path / 'trial')
         assert result['status'] == 'invalid_policy'
     assert writer.calls == 1
+
+
+def test_changed_exploration_guidance_cannot_reuse_an_old_policy(tmp_path, monkeypatch):
+    writer = Writer()
+    runner = Runner(writer, tmp_path)
+    task = {'name': 'a', 'description': 'observe'}
+    runner.prepare_policy(task, ROOT / 'simex/initial', tmp_path / 'trial')
+    monkeypatch.setattr('simex.runner.CAPABILITY_GUIDANCE', 'Changed exploration contract')
+    with pytest.raises(ValueError, match='input changed'):
+        runner.prepare_policy(task, ROOT / 'simex/initial', tmp_path / 'trial')
+    assert writer.calls == 1
