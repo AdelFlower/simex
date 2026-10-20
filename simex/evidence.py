@@ -6,7 +6,6 @@ any hidden simulator state.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import re
@@ -368,6 +367,10 @@ def summarize_public_evidence(evidence: dict, output_dir: str | None) -> dict:
         path = _public_file(entry.get("path"), directory) if isinstance(entry, dict) else None
         if path is not None and isinstance(entry.get("sim_time"), (int, float)):
             action_images.append((entry, path))
+    evidence["action_images"] = [
+        {**{key: entry[key] for key in ("action", "method", "phase", "sim_time") if key in entry},
+         "path": str(path)}
+        for entry, path in action_images]
     actions = []
     for action in evidence.get("actions", []):
         if not isinstance(action, dict) or action.get("method") not in MOTION_METHODS:
@@ -378,18 +381,23 @@ def summarize_public_evidence(evidence: dict, output_dir: str | None) -> dict:
                         **({"result": public_action_result(action["result"])} if "result" in action else {}),
                         **({"error": "Action failed; see the public execution status."} if action.get("error") else {})})
     sources = [p for p in [trace, video, *images, *(p for _, p in action_images)] if p is not None]
-    signature = hashlib.sha256(json.dumps({"version": 2,
-        "files": [(str(p), p.stat().st_size, p.stat().st_mtime_ns) for p in sources],
-        "actions": actions, "diagnostics": {k: evidence.get(k) for k in ('status', 'reason', 'stdout')}},
-        sort_keys=True).encode()).hexdigest()
+    source_metadata = {"version": 3,
+        "files": [[str(p), p.stat().st_size, p.stat().st_mtime_ns] for p in sources],
+        "actions": actions, "diagnostics": {k: evidence.get(k) for k in ('status', 'reason', 'stdout')}}
+    # Compare ordinary cache metadata, never stored content hashes.
+    source_metadata = json.loads(json.dumps(source_metadata))
     cache = directory / "research_evidence.json"
     if cache.exists():
         cached = json.loads(cache.read_text())
-        if cached.get("signature") == signature and all(Path(p).is_file() for p in cached["summary"].get("phase_images", [])):
+        if cached.get("source_metadata") == source_metadata and all(
+                Path(p).is_file() for p in cached["summary"].get("phase_images", [])):
             return {**evidence, **cached["summary"]}
     summary = {"actions": actions}
     try:
         states = _read_trace(trace)
+        if trace is not None:
+            # Preserve every approved robot-state sample for paged research reads.
+            summary["robot_trace"] = states
         if not states:
             states = sorted([state for action in actions for state in (action["start"], action["end"])
                              if "sim_time" in state], key=lambda state: state["sim_time"])
@@ -404,6 +412,6 @@ def summarize_public_evidence(evidence: dict, output_dir: str | None) -> dict:
     except (OSError, ValueError, KeyError, TypeError) as exc:
         summary["evidence_errors"] = [f"Public evidence summary unavailable: {type(exc).__name__}: {exc}"]
     temporary = cache.with_suffix(".tmp")
-    temporary.write_text(json.dumps({"signature": signature, "summary": summary}))
+    temporary.write_text(json.dumps({"source_metadata": source_metadata, "summary": summary}))
     temporary.replace(cache)
     return {**evidence, **summary}

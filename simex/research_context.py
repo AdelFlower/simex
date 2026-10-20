@@ -19,15 +19,16 @@ VERSION = 1
 MAX_PROMPT_CHARS = 64_000
 SUMMARY_CHARS = 34_000
 READ_CHARS = 16_000
-MAX_READ_ROUNDS = 4
+MAX_INTERACTIONS = 20
+MAX_READ_ROUNDS = MAX_INTERACTIONS - 1
 MAX_READ_REQUESTS = 4
 MAX_IMAGES = 4
 MAX_NOTES_CHARS = 2_000
 MAX_PINNED_CHARS = 30_000
 RESEARCH_ROLES = frozenset(("discover_probe", "discover_focus", "discover_revision",
-    "discover_select", "align", "repair_hypotheses", "repair", "screen_tasks", "repair_select"))
+    "discover_select", "discover_code", "align", "repair_hypotheses", "repair", "screen_tasks", "repair_select"))
 
-ACCESS_INSTRUCTIONS = """
+ACCESS_INSTRUCTIONS = ("""
 Research evidence access (not the one-shot robot policy protocol):
 INPUT JSON contains a bounded overview. Fields with evidence_id are excerpts or
 references, NOT complete evidence. All rollouts retain their status and scores;
@@ -36,14 +37,17 @@ To inspect details instead of making your decision yet, return ONLY:
 {"evidence_requests":[{"id":"text_...","offset":0,"limit":8000}],"notes":"concise findings to carry forward"}
 For an image use {"id":"image_..."}. For text you may supply "find":"literal
 substring" to locate a relevant section; the returned page starts at that match.
+Image catalogs list the IDs of original frames available on demand. Read robot_trace
+for individual robot-state samples that are not retained in motion_summary.
 Use only listed IDs, at most 4 requests per round and 16000 returned JSON characters
 per round. Full code may span multiple pages. Do not reconstruct omitted code from
 an excerpt: read the relevant implementation before revising it. Distinguish an
 excerpt from a full execution log, and an unviewed image from visual evidence.
-There are at most 4 read rounds, then a final decision. The latest notes (at most
+""" f"There are at most {MAX_READ_ROUNDS} read rounds and {MAX_INTERACTIONS} interactions in total, including the final decision.\n"
+"""The latest notes (at most
 2000 characters) and latest read results replace earlier pages; they do not append
-unbounded history. Retain your findings in notes. Every call counts toward the
-model budget. Reads never generate a policy or execute an experiment.
+unbounded history. Retain your findings in notes. Research interactions count toward
+the model budget; failed network attempts do not. Reads never generate a policy or execute an experiment.
 When ready, return the originally requested decision JSON without evidence_requests.
 action_summary describes public commands and robot motion only. A close command,
 TCP rise, or subsequent opening does not establish object contact, a grasp, or
@@ -51,7 +55,7 @@ placement success. tcp_rise_after_close_m stops at the next opening command;
 last_motion_rejection with source=policy_stdout is a reported diagnosis, while
 source=action_result is an API failure flag that measured-pose checking may accept.
 Use the independent task outcome and phase images to assess the manipulation.
-""".strip()
+""").strip()
 
 EDIT_INSTRUCTIONS = """
 Output override for a capability library too large to include in full:
@@ -128,7 +132,7 @@ def _action_preview(action):
 
 
 class ResearchContext:
-    def __init__(self, payload, image_paths=(), *, pinned_keys=(), instruction=""):
+    def __init__(self, payload, image_paths=(), *, default_image_paths=None, pinned_keys=(), instruction=""):
         self.assets = {}
         self.image_ids = []
         self._image_by_path = {}
@@ -145,11 +149,12 @@ class ResearchContext:
                 self.assets[identifier] = {"kind": "image", "sha256": digest,
                     "source": str(path), "suffix": path.suffix, "data": data, "labels": []}
                 self.image_ids.append(identifier)
-            elif self.assets[identifier]["sha256"] != digest:
-                raise ContextError("Evidence ID collision")
+        self.default_image_ids = (self.image_ids[:MAX_IMAGES] if default_image_paths is None else
+            list(dict.fromkeys(self._image_by_path[str(path)] for path in default_image_paths))[:MAX_IMAGES])
         self.raw_chars = len(dumps(payload))
         self.input_sha256 = sha(dumps({"version": VERSION, "payload": payload,
             "pinned_keys": list(pinned_keys),
+            "default_image_ids": self.default_image_ids,
             "images": [(p, self.assets[i]["sha256"]) for p, i in self._image_by_path.items()]}))
         # Revisions return whole files. Keep their current implementation EXACT
         # in every turn, rather than asking a fresh call to reconstruct code
@@ -223,8 +228,6 @@ class ResearchContext:
         identifier = "text_" + digest[:32]
         asset = self.assets.setdefault(identifier, {"kind": "text", "sha256": digest,
                                                    "text": text, "labels": []})
-        if asset["sha256"] != digest:
-            raise ContextError("Evidence ID collision")
         if label not in asset["labels"]:
             asset["labels"].append(label)
         result = {"evidence_id": identifier, "chars": len(text), "excerpt": True, **extra}
@@ -258,12 +261,24 @@ class ResearchContext:
                 return result
             return value
         if isinstance(value, list):
+            if key in ("coding_history", "coding_sessions") and value:
+                # Keep all operations readable without an ever-growing overview.
+                records = [self._walk(child, f"{label}[{index}]") for index, child in enumerate(value)]
+                return self._text_ref(dumps(records), label, preview=0, count=len(value))
+            if key in ("robot_trace", "trace_tail", "robot_trace_tail") and value:
+                return self._text_ref(dumps(value), label, preview=0, count=len(value))
+            if key in ("keyframes", "read_images", "action_images") and value:
+                # Page through IDs and capture metadata without filling the overview
+                # with every frame or attaching images before they are requested.
+                catalog = [self._walk(child, f"{label}[{index}]") for index, child in enumerate(value)]
+                return self._text_ref(dumps(catalog), label, preview=0,
+                                      kind="image_catalog", count=len(catalog))
             if key in ("prior_attempts", "recent_research_history", "task_history",
                        "historical_replay_anchors"):
                 return [self._history_record(child, f"{label}[{index}]")
                         if isinstance(child, dict) and len(dumps(child)) > 10_000 else
                         self._walk(child, f"{label}[{index}]") for index, child in enumerate(value)]
-            if key in ("actions", "trace_tail", "robot_trace_tail") and len(dumps(value)) > 1_200:
+            if key == "actions" and len(dumps(value)) > 1_200:
                 indices = sorted(set([0, max(0, len(value)-2), len(value)-1] +
                     [i for i, a in enumerate(value) if isinstance(a, dict) and a.get("error")][:1]))
                 selected = [{"index": i, "record": _action_preview(value[i])} for i in indices if i >= 0]
@@ -311,11 +326,15 @@ class ResearchContext:
         if "attempts" not in value:
             record["outcomes"] = outcomes
         if images and "attempts" not in value:
-            record["images"] = [{"evidence_id": identifier, "kind": "image"}
-                                for identifier in dict.fromkeys(image["evidence_id"] for image in images)]
+            catalog = [{"evidence_id": identifier, "kind": "image"}
+                       for identifier in dict.fromkeys(image["evidence_id"] for image in images)]
+            record["images"] = self._text_ref(dumps(catalog), label + ".images",
+                preview=0, kind="image_catalog", count=len(catalog))
         if "attempts" in value:
             record["attempts"] = [self._history_record(attempt, f"{label}.attempts[{index}]")
                 for index, attempt in enumerate(value["attempts"])]
+        if "coding_history" in value:
+            record["coding_history"] = self._walk(value["coding_history"], label + ".coding_history")
         return record
 
     def _rollout(self, value, label):
@@ -325,7 +344,8 @@ class ResearchContext:
         result["full_result"] = self._text_ref(dumps(value), label, preview=0)
         visible = {key: self._walk(evidence[key], label + ".evidence." + key)
                    for key in ("reason", "action_summary", "recording_errors", "evidence_errors",
-                               "phase_images", "keyframes", "read_images") if key in evidence}
+                               "phase_images", "keyframes", "read_images", "action_images",
+                               "robot_trace", "trace_tail", "robot_trace_tail") if key in evidence}
         stdout = evidence.get("stdout", "")
         if stdout:
             visible["stdout"] = (stdout if len(stdout) <= 400 else
@@ -359,6 +379,7 @@ class ResearchContext:
         evidence = value["evidence"]
         value["evidence"] = {key: child for key, child in evidence.items() if key in
             ("reason", "action_summary", "phase_images", "keyframes", "read_images",
+             "action_images", "robot_trace", "trace_tail", "robot_trace_tail",
              "recording_errors", "evidence_errors", "stdout")}
         stdout = value["evidence"].get("stdout")
         if isinstance(stdout, dict):
@@ -368,7 +389,7 @@ class ResearchContext:
             elif stdout.get("preview"):
                 value["evidence"]["stdout_tail_excerpt"] = stdout["preview"][-80:]
         for key in ("phase_images", "keyframes", "read_images"):
-            if key in value["evidence"]:
+            if isinstance(value["evidence"].get(key), list):
                 value["evidence"][key] = [{k: v for k, v in image.items() if k != "label"}
                     if isinstance(image, dict) else image for image in value["evidence"][key]]
         if "execution" in value:
@@ -403,10 +424,9 @@ class ResearchContext:
                     "raw_payload_chars": self.raw_chars, "summary_chars": len(dumps(self.summary)),
                     "pinned_chars": len(dumps(self.pinned)),
                     "overview_sha256": sha(dumps({**self.summary, **self.pinned})),
-                    "image_count": len(self.image_ids), "assets": index}
+                    "image_count": len(self.image_ids), "default_image_ids": self.default_image_ids,
+                    "assets": index}
         target = self.directory / "manifest.json"
-        if target.exists() and json.loads(target.read_text()) != manifest:
-            raise ContextError("Research evidence checkpoint input changed")
         atomic_json(target, manifest)
         atomic_json(self.directory / "overview.json", {**self.summary, **self.pinned})
         return manifest
@@ -414,6 +434,58 @@ class ResearchContext:
     def image_paths(self, identifiers):
         return [str(self.directory / (identifier + self.assets[identifier]["suffix"]))
                 for identifier in identifiers]
+
+    @classmethod
+    def load(cls, directory):
+        """Restore approved evidence without hash verification or host source reads."""
+        directory = Path(directory).resolve()
+        manifest = json.loads((directory / "manifest.json").read_text())
+        context = cls.__new__(cls)
+        context.directory = directory
+        context.assets, context._image_by_path, context._seen_text = {}, {}, {}
+        for identifier, metadata in manifest["assets"].items():
+            path = (directory / metadata["file"]).resolve()
+            if not path.is_relative_to(directory):
+                raise ContextError("Saved evidence file escapes its context directory")
+            asset = dict(metadata)
+            if asset["kind"] == "image":
+                asset["data"] = path.read_bytes()
+            else:
+                asset["text"] = path.read_text()
+            context.assets[identifier] = asset
+        context.image_ids = [key for key, value in context.assets.items() if value["kind"] == "image"]
+        context.default_image_ids = manifest.get("default_image_ids", context.image_ids[:MAX_IMAGES])
+        context.summary = json.loads((directory / "overview.json").read_text())
+        context.pinned = {}
+        context.raw_chars = manifest["raw_payload_chars"]
+        context.input_sha256 = manifest["input_sha256"]
+        return context
+
+    def retain_assets(self, previous):
+        """Keep old IDs readable as an interactive coding session evolves."""
+        for identifier, asset in previous.assets.items():
+            self.assets.setdefault(identifier, asset)
+            if asset["kind"] == "image" and identifier not in self.image_ids:
+                self.image_ids.append(identifier)
+
+    def coding_prompt(self, instruction, *, notes="", replies=None, image_ids=None):
+        """Render one operation request; the caller owns the coding turn budget."""
+        image_ids = self.default_image_ids if image_ids is None else image_ids
+        if len(image_ids) > MAX_IMAGES or any(
+            identifier not in self.assets or self.assets[identifier]["kind"] != "image"
+            for identifier in image_ids
+        ):
+            raise ContextError("Invalid coding image attachments")
+        meta = {"version": VERSION, "notes": notes[:MAX_NOTES_CHARS],
+                "notes_truncated": len(notes) > MAX_NOTES_CHARS, "read_results": replies or [],
+                "attached_images": [{"image": i + 1, "id": identifier,
+                                     "labels": self.assets[identifier]["labels"][:4]}
+                                    for i, identifier in enumerate(image_ids)]}
+        prompt = instruction + "\n\nINPUT JSON:\n" + dumps(
+            {**self.summary, **self.pinned, "_coding_context": meta})
+        if len(prompt) > MAX_PROMPT_CHARS - 1_000:
+            raise ContextError("Coding prompt exceeds its character budget; no model call was made")
+        return prompt, self.image_paths(image_ids)
 
     def read(self, requests, budget=READ_CHARS):
         if not isinstance(requests, list) or not 1 <= len(requests) <= MAX_READ_REQUESTS:
@@ -466,7 +538,7 @@ class ResearchContext:
 
     def prompt(self, instruction, *, round_index=0, notes="", replies=None,
                reads_so_far=None, image_ids=None):
-        image_ids = self.image_ids[:MAX_IMAGES] if image_ids is None else image_ids
+        image_ids = self.default_image_ids if image_ids is None else image_ids
         if len(image_ids) > MAX_IMAGES:
             raise ContextError("Too many research image attachments")
         meta = {"version": VERSION, "read_rounds_remaining": MAX_READ_ROUNDS-round_index,

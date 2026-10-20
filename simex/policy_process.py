@@ -13,6 +13,13 @@ FORBIDDEN_NAMES = {'open', 'exec', 'eval', 'compile', '__import__', 'globals', '
                    'fromfile', 'tofile', 'memmap', 'ctypeslib', 'f2py'}
 
 
+def _validation_error(message, node):
+    error = ValueError(message)
+    error.lineno = node.lineno
+    error.offset = node.col_offset + 1
+    return error
+
+
 def validate(code):
     if len(code) > 200000:
         raise ValueError('Policy/toolbox exceeds size limit')
@@ -20,14 +27,14 @@ def validate(code):
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             if any(alias.name.split('.')[0] not in ALLOWED_IMPORTS for alias in node.names):
-                raise ValueError('Only numerical Python imports are allowed')
+                raise _validation_error('Only numerical Python imports are allowed', node)
         if isinstance(node, ast.ImportFrom):
             if node.level or not node.module or node.module.split('.')[0] not in ALLOWED_IMPORTS:
-                raise ValueError('Only numerical Python imports are allowed')
+                raise _validation_error('Only numerical Python imports are allowed', node)
         if isinstance(node, ast.Name) and (node.id in FORBIDDEN_NAMES or node.id.startswith('__')):
-            raise ValueError(f'Forbidden name {node.id}')
+            raise _validation_error(f'Forbidden name {node.id}', node)
         if isinstance(node, ast.Attribute) and (node.attr.startswith('__') or node.attr in FORBIDDEN_NAMES):
-            raise ValueError(f'Forbidden attribute {node.attr}')
+            raise _validation_error(f'Forbidden attribute {node.attr}', node)
     return tree
 
 

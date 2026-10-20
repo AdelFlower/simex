@@ -7,7 +7,7 @@ name = "simex-local"
 version = "0.1.0"
 description = "Small-budget SimEX-style MuJoCo to Isaac Sim plate manipulation"
 requires-python = ">=3.10"
-dependencies = ["numpy==2.2.6", "scipy==1.15.3", "mujoco==3.3.7", "Pillow==11.3.0", "PyYAML==6.0.3", "imageio==2.37.0", "imageio-ffmpeg==0.6.0"]
+dependencies = ["numpy==2.2.6", "scipy==1.15.3", "mujoco==3.3.7", "Pillow==11.3.0", "PyYAML==6.0.3", "imageio==2.37.0", "imageio-ffmpeg==0.6.0", "tomli==2.5.0; python_version < '3.11'"]
 
 [project.optional-dependencies]
 test = ["pytest==8.4.2"]

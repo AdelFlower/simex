@@ -26,8 +26,12 @@ if pid_file.exists():
         process = {'state': 'stopped', 'pid': None}
 active = []
 unfinished = []
+network_exempt = 0
 for request in sorted(calls):
-    if not (request.parent / 'result.json').exists():
+    result_path = request.parent / 'result.json'
+    if result_path.exists():
+        network_exempt += json.loads(result_path.read_text()).get('budget_charged') is False
+    else:
         data = json.loads(request.read_text())
         item = {'call': request.parent.name, 'seconds': round(time.time()-data['started_at']),
                 'prompt_chars': data.get('prompt_chars', len(data.get('prompt', ''))),
@@ -43,6 +47,8 @@ if discovery and discovery.get('full_task_verified') is False:
     stage1['message'] = '尚未验证完整入箱能力'
 outcomes = Counter()
 activity = Counter()
+coding_sessions = [{"directory": str(path.parent.relative_to(root)), **json.loads(path.read_text())}
+                   for path in sorted(root.glob("discovery/member_*/cycle_*/coding/summary.json"))]
 for path in root.rglob('result.json'):
     if '/agent_calls/' in str(path) or '/diagnostics/' in str(path):
         continue
@@ -53,7 +59,10 @@ for path in root.rglob('result.json'):
 print(json.dumps({'run': str(root), 'process': process,
                   'latest_events': [json.loads(x) for x in events[-3:]],
                   'model_calls': len(calls), 'active_calls': active, 'unfinished_calls': unfinished,
+                  'model_budget_used': len(calls) - network_exempt,
+                  'network_failures_exempt': network_exempt,
                   'stage1': stage1,
+                  'coding_sessions': coding_sessions,
                   'target_slots': dict(Counter(x['state'] for x in slots)),
                   'rollout_statuses': dict(outcomes),
                   'rollout_activity': dict(activity)}, indent=2, ensure_ascii=False))

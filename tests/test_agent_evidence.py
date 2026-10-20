@@ -7,13 +7,88 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 
-from simex.agent import Agent, AgentError
-from simex import cli
+from simex.agent import Agent, AgentError, AgentTransportError, FIXED_MODEL, InvalidPolicy
+from simex import cli, research
 
 
 def make_agent(monkeypatch, tmp_path):
     monkeypatch.setattr('simex.agent.shutil.which', lambda command: '/usr/bin/' + command)
-    return Agent(tmp_path / 'run', {'model': 'test-model'})
+    return Agent(tmp_path / 'run', {'model': FIXED_MODEL})
+
+
+@pytest.mark.parametrize('returncode,response,prohibited,stderr,expected_error,charged', [
+    (0, None, False, '', AgentError, True),
+    (0, '', False, '', AgentError, True),
+    (0, ' \n\t', False, '', AgentError, True),
+    (0, '{"ok":true}', True, '', InvalidPolicy, True),
+    (1, '{"ok":true}', False, '', AgentError, True),
+    (0, '', False, 'connection reset by peer', AgentTransportError, False),
+    (0, '{"ok":true}', False, '', None, True),
+    (0, '{"ok":true}', False, 'connection reset by peer', None, True),
+])
+def test_call_log_status_matches_outcome(
+        monkeypatch, tmp_path, returncode, response, prohibited, stderr, expected_error, charged):
+    agent = make_agent(monkeypatch, tmp_path)
+
+    def execute(command, **kwargs):
+        work = Path(command[command.index('--bind') + 1])
+        if response is not None:
+            (work / 'response.txt').write_text(response)
+        stdout = ('{"type":"item.completed","item":{"type":"command_execution"}}\n'
+                  if prohibited else '')
+        return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    monkeypatch.setattr('simex.agent.subprocess.run', execute)
+    if expected_error is not None:
+        with pytest.raises(expected_error):
+            agent.ask('align', 'Compare evidence.')
+    else:
+        assert agent.ask('align', 'Compare evidence.') == {'ok': True}
+    call_dir = agent.calls_dir / '00001_align'
+    result = json.loads((call_dir / 'result.json').read_text())
+    assert result['status'] == ('error' if expected_error else 'ok')
+    assert result['returncode'] == returncode
+    assert result['prohibited_tools'] == (['command_execution'] if prohibited else [])
+    assert result['budget_charged'] is charged
+    if expected_error:
+        assert result['reason']
+    assert agent.count == int(charged)
+    assert (call_dir / 'response.txt').read_text() == (response or '')
+    assert Agent(agent.run_dir, agent.config).count == agent.count
+
+
+@pytest.mark.parametrize('role', ['policy', 'discover_probe', 'repair', 'align'])
+def test_model_instructions_are_english_without_forcing_response_language(monkeypatch, tmp_path, role):
+    agent = make_agent(monkeypatch, tmp_path)
+
+    def execute(command, **kwargs):
+        assert 'Use English' not in kwargs['input']
+        assert kwargs['input'].isascii()
+        work = Path(command[command.index('--bind') + 1])
+        (work / 'response.txt').write_text('{"ready":true}')
+        return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+    monkeypatch.setattr('simex.agent.subprocess.run', execute)
+    assert agent._call(role, 'Follow the task instructions.') == '{"ready":true}'
+
+
+def test_builtin_task_prompts_are_english_with_unchanged_goals():
+    from simex.research import DEFAULTS, _auxiliary_selection_tasks
+    from simex.tasks import TASK_IDS, make_task
+
+    for task_id in TASK_IDS:
+        task = make_task(task_id, 42)
+        assert task['description'].isascii()
+        assert '5 cm' in task['description'] and 'red plate' in task['description']
+        assert task['predicate'] == {'all': [
+            {'kind': 'lift', 'object': 'green', 'min': .05},
+            {'kind': 'inside', 'object': 'green'},
+            {'kind': 'outside', 'object': 'red'},
+        ]}
+    auxiliary = _auxiliary_selection_tasks(DEFAULTS)
+    assert len(auxiliary) == 4
+    assert all(task['description'].isascii() for task in auxiliary)
+    assert [task['predicate']['all'][0]['min'] for task in auxiliary] == [.05, .05, .03, .03]
 
 
 def test_every_requested_image_is_actually_attached_in_bounded_batches(monkeypatch, tmp_path):
@@ -71,6 +146,8 @@ def test_timeout_keeps_partial_evidence_and_available_usage(monkeypatch, tmp_pat
     result = json.loads((call / 'result.json').read_text())
     assert result['usage'] == [{'input_tokens': 9, 'output_tokens': 2}]
     assert result['usage_complete'] is False
+    assert result['budget_charged'] is True
+    assert agent.count == agent.attempt_count == 1
 
 
 def test_missing_image_is_not_silently_dropped(monkeypatch, tmp_path):
@@ -82,6 +159,112 @@ def test_missing_image_is_not_silently_dropped(monkeypatch, tmp_path):
         agent.ask('repair_select', 'test', [str(tmp_path / 'missing.png')])
     result = json.loads((agent.calls_dir / '00001_repair_select/result.json').read_text())
     assert result['status'] == 'input_error'
+
+
+@pytest.mark.parametrize('failures', [5, 6])
+def test_network_retries_keep_unique_logs_and_refund_budget_after_restart(monkeypatch, tmp_path, failures):
+    agent = make_agent(monkeypatch, tmp_path)
+    agent.config['max_agent_calls'] = 1
+    attempts = []
+
+    def execute(command, **kwargs):
+        attempts.append(kwargs['input'])
+        if len(attempts) <= failures:
+            return SimpleNamespace(returncode=1, stderr='',
+                stdout='{"type":"error","message":"stream disconnected: connection reset"}\n')
+        work = Path(command[command.index('--bind') + 1])
+        (work / 'response.txt').write_text('{"aligned":true}')
+        return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+    monkeypatch.setattr('simex.agent.subprocess.run', execute)
+    decision = tmp_path / 'decision.json'
+    if failures == 6:
+        with pytest.raises(AgentTransportError):
+            research._ask(agent, decision, 'align', 'Compare evidence.', {})
+        assert agent.count == 0 and agent.attempt_count == 6
+        errors = json.loads((tmp_path / 'decision.context/turn_00.transport_errors.json').read_text())
+        assert len(errors) == 6 and errors[-1]['automatic_retry'] is False
+        agent = Agent(agent.run_dir, {**agent.config, 'max_agent_calls': 1})
+        assert agent.count == 0 and agent.attempt_count == 6
+    assert research._ask(agent, decision, 'align', 'Compare evidence.', {}) == {'aligned': True}
+    assert agent.count == 1 and agent.attempt_count == failures + 1
+    assert len(set(attempts)) == 1
+    records = sorted(agent.calls_dir.glob('*/result.json'))
+    assert len(records) == failures + 1
+    assert [json.loads(path.read_text())['budget_charged'] for path in records] == [False] * failures + [True]
+    assert [path.parent.name for path in records] == [f'{i:05d}_align' for i in range(1, failures + 2)]
+    restored = Agent(agent.run_dir, {**agent.config, 'max_agent_calls': 1})
+    assert restored.count == 1 and restored.attempt_count == failures + 1
+    assert research._ask(restored, decision, 'align', 'Compare evidence.', {}) == {'aligned': True}
+    with pytest.raises(AgentError, match='budget exhausted'):
+        restored.ask('align', 'Another decision.')
+    assert len(attempts) == failures + 1
+
+
+@pytest.mark.parametrize('failure,exempt', [
+    ('network_timeout', True), ('network_stderr', True),
+    ('plain_timeout', False), ('invalid_json', False), ('authentication', False),
+    ('partial_response', False), ('prohibited_tool', False),
+])
+def test_only_confirmed_network_failures_without_answers_are_budget_exempt(
+        monkeypatch, tmp_path, failure, exempt):
+    agent = make_agent(monkeypatch, tmp_path)
+
+    def execute(command, **kwargs):
+        work = Path(command[command.index('--bind') + 1])
+        if failure.endswith('timeout'):
+            stderr = b'connection timed out' if exempt else b'no diagnostics'
+            raise subprocess.TimeoutExpired(command, 1, stderr=stderr)
+        if failure == 'invalid_json':
+            (work / 'response.txt').write_text('invalid JSON')
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        if failure == 'partial_response':
+            (work / 'response.txt').write_text('partial answer')
+        if failure == 'authentication':
+            return SimpleNamespace(returncode=1, stdout='', stderr='websocket error: 401 Unauthorized')
+        stdout = ('{"type":"item.completed","item":{"type":"command_execution"}}\n'
+                  if failure == 'prohibited_tool' else '')
+        return SimpleNamespace(returncode=1, stdout=stdout, stderr='connection reset by peer')
+
+    monkeypatch.setattr('simex.agent.subprocess.run', execute)
+    with pytest.raises(AgentError) as error:
+        agent.ask('align', 'Compare evidence.')
+    assert isinstance(error.value, AgentTransportError) is exempt
+    assert agent.count == (0 if exempt else 1)
+    result = json.loads((agent.calls_dir / '00001_align/result.json').read_text())
+    assert result['budget_charged'] is (not exempt)
+    assert Agent(agent.run_dir, agent.config).count == agent.count
+
+
+def test_parallel_network_refund_does_not_reuse_other_call_id(monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    agent = make_agent(monkeypatch, tmp_path)
+    agent.config['max_agent_calls'] = 2
+    barrier = threading.Barrier(2)
+
+    def execute(command, **kwargs):
+        if 'parallel' in kwargs['input']:
+            barrier.wait(timeout=5)
+        if 'network_failure' in kwargs['input']:
+            return SimpleNamespace(returncode=1, stdout='', stderr='connection reset by peer')
+        work = Path(command[command.index('--bind') + 1])
+        (work / 'response.txt').write_text('{"ok":true}')
+        return SimpleNamespace(returncode=0, stdout='', stderr='')
+
+    monkeypatch.setattr('simex.agent.subprocess.run', execute)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        failed = pool.submit(agent.ask, 'align', 'parallel network_failure')
+        completed = pool.submit(agent.ask, 'align', 'parallel success')
+        with pytest.raises(AgentTransportError):
+            failed.result()
+        assert completed.result() == {'ok': True}
+    assert agent.count == 1 and agent.attempt_count == 2
+    assert agent.ask('align', 'Next call.') == {'ok': True}
+    assert agent.count == 2 and agent.attempt_count == 3
+    assert len(list(agent.calls_dir.glob('*/request.json'))) == 3
+    assert (agent.calls_dir / '00003_align/result.json').exists()
 
 
 def test_cli_records_startup_failures_before_runner_exists(monkeypatch, tmp_path):

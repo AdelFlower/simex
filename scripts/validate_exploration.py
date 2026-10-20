@@ -27,7 +27,7 @@ def main():
     initial = ROOT / 'simex/initial'
     tasks = [make_task('far_plate', 42), make_task('far_plate', 43)]
     tasks[1].update(name='prerequisite_lift',
-                    description='把绿色盘子从桌面抬起至少2厘米，红盘保持在箱外。无需搬运入箱。',
+                    description='Lift the green plate at least 2 cm off the table. Keep the red plate outside the tote. Transport into the tote is not required.',
                     predicate={'all': [{'kind': 'lift', 'object': 'green', 'min': .02},
                                        {'kind': 'outside', 'object': 'red'}]})
     plan = {'purpose': 'engineering_validation_not_research', 'engine': 'mujoco',

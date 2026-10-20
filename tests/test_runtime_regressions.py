@@ -90,6 +90,76 @@ class RuntimeRegressionTests(unittest.TestCase):
         self.assertEqual(self.target(), resumed)
         self.assertEqual(self.worker.policy_calls, 1)
 
+    def test_interrupted_retry_cannot_reuse_old_startup_failure(self):
+        with patch('simex.runner.subprocess.Popen', side_effect=OSError('missing bubblewrap')):
+            with self.assertRaises(research.ResearchError):
+                self.target()
+        old_result, _ = self.persisted()
+        with patch('simex.runner.score', side_effect=KeyboardInterrupt('interrupted before result save')):
+            with self.assertRaises(KeyboardInterrupt):
+                self.target()
+        out = self.root / 'trial'
+        self.assertFalse((out / 'result.json').exists())
+        self.assertEqual(research._json(out / 'research_attempts/prior_results/000.json'), old_result)
+        self.assertEqual(research._json(out / 'research_attempts/000.json'), old_result)
+        self.assertEqual(self.worker.policy_calls, 1)
+        ledger_path = self.root / 'target_ledger.json'
+        ledger = research._json(ledger_path)
+        self.assertEqual(ledger['slots']['adapt/far_plate/00']['state'], 'unresolved_infrastructure')
+        # Also exercise a hard exit that left the reservation in "running".
+        for state in ('unresolved_infrastructure', 'running'):
+            ledger['slots']['adapt/far_plate/00']['state'] = state
+            research._save(ledger_path, ledger)
+            with self.assertRaisesRegex(research.ResearchError, 'refusing automatic rerun'):
+                self.target()
+            self.assertEqual(self.worker.policy_calls, 1)
+            self.assertFalse((out / 'result.json').exists())
+
+    def test_legacy_startup_result_cannot_override_execution_handshake(self):
+        out = self.root / 'trial'
+        old_result = {'status': 'infrastructure_error', 'failure_kind': 'infrastructure',
+                      'actual_started': False, 'success': False}
+        research._save(out / 'result.json', old_result)
+        research._save(out / 'execution.json', {'phase': 'connected', 'actual_started': True})
+        ledger_path = self.root / 'target_ledger.json'
+        ledger = research._json(ledger_path)
+        ledger['slots']['adapt/far_plate/00']['state'] = 'pending_infrastructure'
+        research._save(ledger_path, ledger)
+        with patch.object(self.runner, 'rollout') as rollout:
+            with self.assertRaisesRegex(research.ResearchError, 'refusing automatic rerun'):
+                self.target()
+            with self.assertRaisesRegex(research.ResearchError, 'refusing automatic rerun'):
+                research._run(self.runner, 'isaac', make_task('far_plate', 41),
+                              ROOT / 'simex/initial', out)
+            rollout.assert_not_called()
+        self.assertEqual(self.persisted()[0], old_result)
+        self.assertEqual(self.persisted()[1]['state'], 'unresolved_infrastructure')
+
+    def test_cached_target_policy_can_resume_after_using_last_model_call(self):
+        agent = self.runner.agent
+        agent.config = {'max_agent_calls': 1}
+        agent.count = 0
+
+        def generate(*_):
+            agent.count += 1
+            self.assertEqual(agent.count, 1, 'Cached policy must not be regenerated')
+            return 'robot.state()\n'
+
+        with patch.object(agent, 'policy', side_effect=generate) as policy:
+            with patch('simex.runner.subprocess.Popen', side_effect=OSError('missing bubblewrap')):
+                with self.assertRaises(research.ResearchError):
+                    self.target()
+            self.assertEqual(agent.count, 1)
+            self.assertEqual(self.persisted()[1]['state'], 'pending_infrastructure')
+            self.assertEqual(self.worker.policy_calls, 0)
+            result = self.target()
+            self.assertTrue(result['actual_started'])
+            self.assertEqual(self.persisted()[1]['state'], 'complete')
+            self.assertEqual(self.target(), result)
+            self.assertEqual(self.worker.policy_calls, 1)
+            policy.assert_called_once()
+        self.assertEqual(agent.count, 1)
+
     def test_sandbox_exit_before_connection_is_infrastructure(self):
         with patch('simex.runner.policy_command', return_value=['/usr/bin/false']):
             with self.assertRaises(research.ResearchError):
@@ -152,6 +222,19 @@ class RuntimeRegressionTests(unittest.TestCase):
         self.assertEqual(self.worker.policy_calls, 1)
         result = json.loads((self.root / 'source/result.json').read_text())
         self.assertEqual(result['failure_kind'], 'infrastructure')
+
+    def test_source_execution_without_result_is_not_rerun(self):
+        self.runner.workers['mujoco'] = self.worker
+        out = self.root / 'source'
+        args = (self.runner, 'mujoco', make_task('far_plate', 41), ROOT / 'simex/initial', out)
+        with patch('simex.runner.score', side_effect=KeyboardInterrupt('interrupted before result save')):
+            with self.assertRaises(KeyboardInterrupt):
+                research._run(*args, script='robot.state()\n')
+        self.assertFalse((out / 'result.json').exists())
+        self.assertTrue(research._json(out / 'execution.json')['actual_started'])
+        with self.assertRaisesRegex(research.ResearchError, 'refusing automatic rerun'):
+            research._run(*args, script='robot.state()\n')
+        self.assertEqual(self.worker.policy_calls, 1)
 
     def test_malformed_action_remains_policy_error(self):
         self.runner.agent.script = 'robot.move_joints([0, 0])\n'

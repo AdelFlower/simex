@@ -45,7 +45,9 @@ pyyaml==6.0.3
 scipy==1.15.3
     # via simex-local (pyproject.toml)
 tomli==2.5.0
-    # via pytest
+    # via
+    #   simex-local (pyproject.toml)
+    #   pytest
 typing-extensions==4.16.0
     # via
     #   etils

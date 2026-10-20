@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 import yaml
-from .agent import Agent
+from .agent import Agent, FIXED_MODEL
 from .runner import Runner, ROOT
 from .storage import atomic_json
 from .tasks import TASK_IDS, make_task
@@ -42,9 +42,8 @@ def _doctor_fingerprint(runner):
     return research._digest({'runtime': research._provenance(runner.config), 'script': SMOKE_SCRIPT})
 
 
-def _health_satisfies(record, engines, fingerprint, check_agent=True):
-    return (record.get('fingerprint') == fingerprint
-            and all(record.get('engines', {}).get(engine, {}).get('passed') for engine in engines)
+def _health_satisfies(record, engines, check_agent=True):
+    return (all(record.get('engines', {}).get(engine, {}).get('passed') for engine in engines)
             and (not check_agent or record.get('model_checked') is True))
 
 
@@ -54,8 +53,6 @@ def doctor(runner, agent, run_dir, check_agent=True, engines=('mujoco', 'isaac')
         raise ValueError('Diagnostics require mujoco and/or isaac')
     fingerprint = _doctor_fingerprint(runner)
     previous = json.loads(path.read_text()) if path.exists() else {}
-    if previous.get('fingerprint') != fingerprint:
-        previous = {}
     results = dict(previous.get('engines', {}))
     model_checked = previous.get('model_checked') is True
     for engine in engines:
@@ -95,11 +92,8 @@ def doctor(runner, agent, run_dir, check_agent=True, engines=('mujoco', 'isaac')
 def _ensure_doctor(runner, agent, run_dir, engines):
     path = Path(run_dir) / 'doctor.json'
     previous = json.loads(path.read_text()) if path.exists() else {}
-    fingerprint = _doctor_fingerprint(runner)
-    if _health_satisfies(previous, engines, fingerprint):
+    if _health_satisfies(previous, engines):
         return
-    if previous.get('fingerprint') != fingerprint:
-        previous = {}
     missing = tuple(engine for engine in engines
                     if not previous.get('engines', {}).get(engine, {}).get('passed'))
     # If only model connectivity is missing, recheck one source diagnostic as
@@ -115,7 +109,8 @@ def main(argv=None):
         sub = commands.add_parser(command)
         sub.add_argument('--run', type=Path, default=Path('runs/small_v6'))
         sub.add_argument('--config', type=Path, default=Path('configs/small.yaml'))
-        sub.add_argument('--model', default=None)
+        sub.add_argument('--model', choices=[FIXED_MODEL], default=None,
+                         help=f'Model is fixed to {FIXED_MODEL}')
         if command == 'doctor':
             sub.add_argument('--offline', action='store_true', help='Test physics without calling the model')
             sub.add_argument('--engine', choices=['mujoco', 'isaac', 'all'], default='all',

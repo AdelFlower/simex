@@ -12,7 +12,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from .agent import AgentError, InvalidPolicy
+from .agent import AgentBudgetExhausted, AgentError, InvalidPolicy
 from .contracts import CAPABILITY_GUIDANCE
 from .errors import InfrastructureError, PolicyRequestError
 from .evidence import action_summary
@@ -187,22 +187,21 @@ class Runner:
         """Generate once per fresh trial, allowing independent source calls in parallel."""
         out = Path(out).resolve()
         out.mkdir(parents=True, exist_ok=True)
+        path = out / 'policy_generation.json'
+        if path.exists():
+            return json.loads(path.read_text())
         settings = getattr(self.agent, 'generation_settings', None)
         signature = hashlib.sha256(json.dumps({'name': task['name'], 'description': task['description'],
                     'toolbox': toolbox_hash(toolbox),
                     'execution_guidance': CAPABILITY_GUIDANCE,
                     'generation_settings': settings() if callable(settings) else {}},
                     sort_keys=True).encode()).hexdigest()
-        path = out / 'policy_generation.json'
-        if path.exists():
-            result = json.loads(path.read_text())
-            if result['signature'] != signature:
-                raise ValueError('Cached policy generation input changed')
-            return result
         try:
             script = self.generate_policy(task, toolbox, out)
             validate(script)
             result = dict(status='ready', script=script, signature=signature)
+        except AgentBudgetExhausted:
+            raise
         except (InvalidPolicy, SyntaxError, ValueError) as exc:
             result = dict(status='invalid_policy', reason=str(exc), signature=signature)
         except AgentError as exc:
@@ -358,6 +357,8 @@ class Runner:
             status = 'success' if success else ('failed' if status == 'completed' else status)
         except InvalidPolicy as exc:
             status, reason = 'invalid_policy', str(exc)
+        except AgentBudgetExhausted:
+            raise
         except AgentError as exc:
             status, reason = 'generation_error', str(exc)
         except Exception as exc:

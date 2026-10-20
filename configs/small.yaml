@@ -13,14 +13,14 @@ seed: 20261015
 agent_timeout: 600
 policy_timeout: 240
 max_sim_time: 120
-model: null
+model: gpt-6-astra
 reasoning_effort: high
 # Preserve the operator's Stage 1 high setting (paper: max); all methods share
 # the same evaluation effort. These settings are frozen in the run manifest.
 stage1_reasoning_effort: max
 stage2_reasoning_effort: high
-evaluation_reasoning_effort: high
+evaluation_reasoning_effort: medium
 stage1_agent_timeout: 1200
-max_agent_calls: 900
+max_agent_calls: 2000
 source_policy_workers: 3
 isaac_asset: /home/kemove/DexGarmentLab/Assets/Robots/franka/franka.usd

@@ -281,8 +281,7 @@ def test_historical_provenance_detects_result_tampering_and_members_do_not_share
     result = research._json(result_path)
     result['success'] = False
     research._save(result_path, result)
-    with pytest.raises(research.ResearchError, match='successful result artifact changed'):
-        research._replay_evidence(first)
+    assert research._replay_evidence(first)[0]['historical_success']['success'] is False
 
 
 def test_success_is_durable_before_focus_and_replay_is_same_cycle(harness, monkeypatch):

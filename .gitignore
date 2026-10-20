@@ -16,5 +16,7 @@ dist/
 assets/
 tests/*
 !tests/test_cli_diagnostics.py
+!tests/test_fetch_panda.py
+!tests/test_coding.py
 !tests/test_initial_geometry.py
 direct_plate/

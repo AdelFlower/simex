@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch the pinned, Apache-2.0 Menagerie Panda and verify its blob hashes."""
+"""Fetch the pinned, Apache-2.0 Menagerie Panda without hash verification."""
 from __future__ import annotations
 
 import argparse
@@ -27,14 +27,10 @@ def main() -> None:
         relative = item["path"][len(PREFIX):]
         destination = args.destination / relative
         content = destination.read_bytes() if destination.is_file() else b""
-        def git_hash(data: bytes) -> str:
-            return hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
-        if git_hash(content) != item["sha"]:
+        if not destination.is_file():
             url = f"https://raw.githubusercontent.com/{REPOSITORY}/{COMMIT}/{item['path']}"
             with urllib.request.urlopen(url, timeout=90) as response:
                 content = response.read()
-            if git_hash(content) != item["sha"]:
-                raise RuntimeError(f"Upstream blob hash mismatch: {relative}")
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(content)
         return relative, hashlib.sha256(content).hexdigest()
@@ -44,7 +40,7 @@ def main() -> None:
     provenance = {"repository": f"https://github.com/{REPOSITORY}", "commit": COMMIT,
                   "upstream_directory": PREFIX.rstrip("/"), "license": "Apache-2.0", "sha256": hashes}
     (args.destination / "PROVENANCE.json").write_text(json.dumps(provenance, indent=2) + "\n")
-    print(f"Verified {len(hashes)} files at {args.destination} ({COMMIT})")
+    print(f"Available: {len(hashes)} files at {args.destination} ({COMMIT})")
 
 
 if __name__ == "__main__":

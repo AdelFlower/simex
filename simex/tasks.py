@@ -12,9 +12,9 @@ JOINT_LIMITS = np.array([
     [-2.8973, 2.8973],
 ])
 DESCRIPTIONS = {
-    'far_plate': '把桌面远侧的绿色薄盘抓起，抬高至少5厘米，完整放入蓝灰色开放箱。红盘必须留在箱外。',
-    'far_to_near': '把远侧绿色薄盘抬高至少5厘米，搬运到靠近机器人的蓝灰色箱内。红盘必须留在箱外。',
-    'shifted_single': '箱体位置和角度已有变化。根据相机找到绿色薄盘，将其抬高至少5厘米后完整放入蓝灰色箱。红盘必须留在箱外。',
+    'far_plate': 'Pick up the thin green plate on the far side of the table, lift it at least 5 cm, and place it completely inside the open blue-gray tote. The red plate must remain outside the tote.',
+    'far_to_near': 'Lift the thin green plate on the far side at least 5 cm and move it into the blue-gray tote near the robot. The red plate must remain outside the tote.',
+    'shifted_single': 'The tote position and orientation have changed. Locate the thin green plate using the camera, lift it at least 5 cm, and place it completely inside the blue-gray tote. The red plate must remain outside the tote.',
 }
 
 

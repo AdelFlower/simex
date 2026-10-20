@@ -195,19 +195,64 @@ def test_unresolved_target_is_not_silently_reexecuted(harness):
     assert len(runner.calls) == calls
 
 
-def test_modified_frozen_toolbox_and_schedule_are_rejected(harness):
+def test_resume_does_not_verify_frozen_artifact_or_schedule_hashes(harness):
     runner, agent, run = harness
     research.discover(runner, agent, run, SMALL)
-    original = (run / "frozen" / "stage1" / "toolbox.py").read_text()
-    (run / "frozen" / "stage1" / "toolbox.py").write_text("CHANGED = True\n")
-    with pytest.raises(research.ResearchError, match="integrity"):
-        research.adapt(runner, agent, run, SMALL)
-    (run / "frozen" / "stage1" / "toolbox.py").write_text(original)
+    (run / "frozen" / "initial" / "skill.md").write_text("Updated initial usage notes\n")
+    (run / "frozen" / "stage1" / "skill.md").write_text("Updated source usage notes\n")
+    selection = research._json(run / "selection_tasks.json")
+    selection[0]["description"] = "Updated selection instructions"
+    research._save(run / "selection_tasks.json", selection)
     ledger = research._json(run / "target_ledger.json")
     ledger["slots"]["adapt/far/00"]["seed"] += 1
     research._save(run / "target_ledger.json", ledger)
-    with pytest.raises(research.ResearchError, match="schedule was modified"):
-        research.adapt(runner, agent, run, SMALL)
+    manifest = research._json(run / "manifest.json")
+    manifest["provenance"]["code_sha256"] = "legacy implementation hash"
+    research._save(run / "manifest.json", manifest)
+    assert research._initialize(run, SMALL) == manifest["config"]
+    calls, queries = len(runner.calls), agent.count
+    research.discover(runner, agent, run, SMALL)
+    assert (len(runner.calls), agent.count) == (calls, queries)
+
+
+def test_missing_artifacts_and_changed_budgets_still_stop_resume(harness):
+    _, _, run = harness
+    research._initialize(run, SMALL)
+    with pytest.raises(research.ResearchError, match="budgets/seeds"):
+        research._initialize(run, {**SMALL, "cycles": SMALL["cycles"] + 1})
+    (run / "target_ledger.json").unlink()
+    with pytest.raises(research.ResearchError, match="ledger is missing"):
+        research._initialize(run, SMALL)
+    (run / "frozen/initial/skill.md").unlink()
+    with pytest.raises(research.ResearchError, match="artifact missing"):
+        research._check_frozen(run / "frozen/initial")
+
+
+def test_completed_rollouts_ignore_hash_metadata_without_reexecution(harness):
+    runner, _, run = harness
+    research._initialize(run, SMALL)
+    toolbox = run / "frozen/initial"
+    target_dir = run / "target"
+    research._target(runner, run, "adapt/far/00", toolbox, target_dir)
+    result = research._json(target_dir / "result.json")
+    result["steps"] += 1
+    research._save(target_dir / "result.json", result)
+    ledger = research._json(run / "target_ledger.json")
+    ledger["slots"]["adapt/far/00"].update(toolbox_sha256="outdated", result_sha256="outdated")
+    research._save(run / "target_ledger.json", ledger)
+    count = len(runner.calls)
+    assert research._target(runner, run, "adapt/far/00", toolbox, target_dir) == result
+    assert len(runner.calls) == count
+    source_dir = run / "source"
+    source_task = task("far", 42)
+    expected = research._run(runner, "mujoco", source_task, toolbox, source_dir)
+    request = research._json(source_dir / "research_request.json")
+    request.update(toolbox_sha256="outdated", script_sha256="outdated")
+    research._save(source_dir / "research_request.json", request)
+    count = len(runner.calls)
+    assert research._run(runner, "mujoco", source_task, toolbox, source_dir) == expected
+    assert len(runner.calls) == count
+    assert research._json(source_dir / "research_request.json") == request
 
 
 def test_default_schedule_has_exactly_sixty_target_slots(harness):
@@ -287,6 +332,63 @@ def test_report_separates_budget_completion_from_valid_physics(harness):
 ])
 def test_toolbox_runtime_contract_is_validated_before_physics(tmp_path, code):
     with pytest.raises(research.ResearchError, match="Invalid proposed toolbox"):
+        research._write_toolbox(tmp_path / "candidate", {"toolbox.py": code, "skill.md": "notes"})
+
+
+@pytest.mark.parametrize("signature,decorator", [
+    ("", ""),
+    ("self", ""),
+    ("self, **kwargs", ""),
+    ("self, *, robot", ""),
+    ("self, robot, required", ""),
+    ("self, robot, required, /", ""),
+    ("self, robot, *, required", ""),
+    ("self, *args, required", ""),
+    ("robot, required", "staticmethod"),
+    ("cls", "classmethod"),
+])
+def test_toolbox_rejects_constructor_argument_mismatch(tmp_path, signature, decorator):
+    prefix = f"    @{decorator}\n" if decorator else ""
+    code = f"class Toolbox:\n{prefix}    def __init__({signature}):\n        pass\n"
+    destination = tmp_path / "candidate"
+    with pytest.raises(research.InvalidToolbox, match=r"must accept Toolbox\(robot\)"):
+        research._write_toolbox(destination, {"toolbox.py": code, "skill.md": "notes"})
+    assert not destination.exists()
+
+
+@pytest.mark.parametrize("signature,decorator", [
+    ("self, robot", ""),
+    ("self, arm", ""),
+    ("self, robot=None", ""),
+    ("self, robot, option=None", ""),
+    ("self, robot, /", ""),
+    ("self, /, robot", ""),
+    ("self, robot, *, option=None", ""),
+    ("self, *args", ""),
+    ("*args, **kwargs", ""),
+    ("robot", "staticmethod"),
+    ("cls, robot", "classmethod"),
+])
+def test_toolbox_accepts_compatible_constructor_arguments(tmp_path, signature, decorator):
+    prefix = f"    @{decorator}\n" if decorator else ""
+    code = f"class Toolbox:\n{prefix}    def __init__({signature}):\n        pass\n"
+    destination = tmp_path / "candidate"
+    research._write_toolbox(destination, {"toolbox.py": code, "skill.md": "notes"})
+    # Independently verify that accepted signatures match the runtime call.
+    namespace = {}
+    exec(code, namespace)
+    namespace["Toolbox"](object())
+    assert (destination / "toolbox.py").read_text() == code
+
+
+def test_toolbox_constructor_validation_does_not_execute_candidate(tmp_path):
+    code = "raise RuntimeError('must not execute during validation')\n" + INITIAL_CODE
+    research._write_toolbox(tmp_path / "candidate", {"toolbox.py": code, "skill.md": "notes"})
+
+
+def test_toolbox_checks_last_constructor_definition(tmp_path):
+    code = INITIAL_CODE + "    def __init__(self):\n        pass\n"
+    with pytest.raises(research.InvalidToolbox, match=r"must accept Toolbox\(robot\)"):
         research._write_toolbox(tmp_path / "candidate", {"toolbox.py": code, "skill.md": "notes"})
 
 
@@ -428,15 +530,16 @@ def test_selection_ranks_full_then_common_auxiliary_and_never_fast_failure(
     assert all('selection_lift_' not in json.dumps(payload) for _, payload, _ in agent.calls)
 
 
-def test_frozen_auxiliary_schedule_tampering_rejected_even_after_completion(harness):
+def test_completed_discovery_does_not_verify_auxiliary_schedule_hash(harness):
     runner, agent, run = harness
     research.discover(runner, agent, run, SMALL)
     path = run / 'auxiliary_selection_tasks.json'
     tasks = research._json(path)
     tasks[0]['predicate']['all'][0]['min'] = .001
     research._save(path, tasks)
-    with pytest.raises(research.ResearchError, match='selection tasks were modified'):
-        research.discover(runner, agent, run, SMALL)
+    count = len(runner.calls), agent.count
+    assert research.discover(runner, agent, run, SMALL)["process_complete"]
+    assert (len(runner.calls), agent.count) == count
 
 
 def test_stage1_report_shows_all_nine_trials_and_keeps_stage1_call_count(harness):

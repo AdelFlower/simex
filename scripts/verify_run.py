@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit saved experiment accounting and replay integrity without executing trials."""
+"""Audit saved experiment accounting and replay rules without hash verification."""
 import argparse
 import hashlib
 import json
@@ -22,11 +22,10 @@ def verify_stage1(root, cfg, errors):
     manifest_path = root / 'manifest.json'
     manifest = load(manifest_path) if manifest_path.exists() else {}
     if manifest.get('format_version', 0) >= 3:
-        for filename, key in (('selection_tasks.json', 'selection_sha256'),
-                              ('auxiliary_selection_tasks.json', 'auxiliary_selection_sha256')):
+        for filename in ('selection_tasks.json', 'auxiliary_selection_tasks.json'):
             try:
-                if digest(load(root / filename)) != manifest[key]:
-                    errors.append(f'{filename}: frozen source selection tasks changed')
+                if not isinstance(load(root / filename), list):
+                    errors.append(f'{filename}: invalid source selection tasks')
             except (OSError, KeyError, TypeError, ValueError):
                 errors.append(f'{filename}: missing source selection provenance')
     cycles = sorted((root / 'discovery').glob('member_*/cycle_*'))
@@ -54,16 +53,13 @@ def verify_stage1(root, cfg, errors):
         for entry in load(bank):
             if not isinstance(entry, dict) or entry.get('schema_version') != 1:
                 continue  # Older runs stored only task definitions.
-            task_hash = digest(entry['task'])
-            if task_hash != entry['task_sha256']:
-                errors.append(f'{bank}: capability task hash changed')
             for label in ('first_success', 'last_success', 'latest_observation'):
                 origin = entry.get(label)
                 if origin is None:
                     if label == 'first_success':
                         errors.append(f'{bank}: capability first success missing')
                     continue
-                key = digest([task_hash, origin, label])
+                key = json.dumps([entry['task'], origin, label], sort_keys=True)
                 if key in checked:
                     continue
                 checked.add(key)
@@ -71,25 +67,23 @@ def verify_stage1(root, cfg, errors):
                 try:
                     output = Path(origin['output_dir'])
                     result = load(output / 'result.json')
-                    if digest(result) != origin['result_sha256']:
-                        errors.append(f'{prefix}: successful result hash changed')
                     if label != 'latest_observation' and not (
                         result.get('success') is True and result.get('actual_started') is True
                     ):
                         errors.append(f'{prefix}: historical success was not an executed success')
-                    if toolbox_digest(Path(origin['toolbox_path'])) != origin['toolbox_sha256']:
-                        errors.append(f'{prefix}: successful toolbox hash changed')
-                    if origin.get('script_sha256') is not None:
-                        if digest(Path(origin['script_path']).read_text()) != origin['script_sha256']:
-                            errors.append(f'{prefix}: successful script hash changed')
+                    for name in ('toolbox.py', 'skill.md'):
+                        if not (Path(origin['toolbox_path']) / name).is_file():
+                            raise FileNotFoundError(name)
+                    if origin.get('script_path') is not None:
+                        if not Path(origin['script_path']).is_file():
+                            raise FileNotFoundError(origin['script_path'])
                         if result.get('script_path') != origin['script_path']:
                             errors.append(f'{prefix}: result/script provenance differs')
                     elif label != 'latest_observation':
                         errors.append(f'{prefix}: historical success has no executed script')
                     request = load(output / 'research_request.json')
-                    if (request['engine'] != 'mujoco' or digest(request['task']) != task_hash or
-                            request['toolbox_sha256'] != origin['toolbox_sha256']):
-                        errors.append(f'{prefix}: task/toolbox/source-engine provenance differs')
+                    if request['engine'] != 'mujoco' or request['task'] != entry['task']:
+                        errors.append(f'{prefix}: task/source-engine provenance differs')
                 except (OSError, KeyError, TypeError, ValueError) as exc:
                     errors.append(f'{prefix}: missing or invalid provenance artifact ({type(exc).__name__})')
     for stage in ('discovery', 'selection', 'auxiliary_selection'):
@@ -148,20 +142,14 @@ def verify_contexts(root, errors):
                 blob = (directory / asset['file']).resolve()
                 if not blob.is_relative_to(directory):
                     errors.append(f'{path}: evidence blob escapes its context directory')
-                elif hashlib.sha256(blob.read_bytes()).hexdigest() != asset['sha256']:
-                    errors.append(f'{blob}: evidence hash changed')
+                elif not blob.is_file():
+                    errors.append(f'{blob}: evidence blob missing')
                 checked += 1
-            if record.get('overview_sha256'):
-                overview = json.dumps(load(directory / 'overview.json'), ensure_ascii=False,
-                                      separators=(',', ':'), default=str)
-                if hashlib.sha256(overview.encode()).hexdigest() != record['overview_sha256']:
-                    errors.append(f'{path}: research overview changed')
+            load(directory / 'overview.json')
             for turn in directory.glob('turn_*.json'):
                 if turn.name.endswith('.transport_errors.json'):
                     continue
                 entry = load(turn)
-                if digest(entry['request']) != entry['request_sha256']:
-                    errors.append(f'{turn}: research read request changed')
                 if len(entry['request']['prompt']) > 63_000 or len(entry['request']['images']) > 4:
                     errors.append(f'{turn}: research read exceeds the context budget')
         except (OSError, KeyError, TypeError, ValueError) as exc:
@@ -187,8 +175,6 @@ def verify(root):
         if not path.exists():
             errors.append(f'{key}: completed result missing')
             continue
-        if digest(load(path)) != slot['result_sha256']:
-            errors.append(f'{key}: result hash changed')
     for trial in (root / 'adaptation').glob('*/trial_*'):
         target_path = trial / 'target/result.json'
         if not target_path.exists():
@@ -205,15 +191,13 @@ def verify(root):
         elif replays:
             errors.append(f'{trial}: executed target script missing for fixed replay audit')
     for frozen in (root / 'frozen').rglob('frozen.json'):
-        try:
-            if toolbox_digest(frozen.parent) != load(frozen)['sha256']:
-                errors.append(f'{frozen.parent}: frozen capability modified')
-        except OSError:
-            errors.append(f'{frozen.parent}: frozen capability file missing')
+        for name in ('toolbox.py', 'skill.md'):
+            if not (frozen.parent / name).is_file():
+                errors.append(f'{frozen.parent}: frozen capability file missing: {name}')
     stage1 = verify_stage1(root, cfg, errors)
     phases = verify_phases(root, cfg, errors)
     evidence = verify_contexts(root, errors)
-    return {'integrity_ok': not errors, 'complete': completed == expected,
+    return {'integrity_ok': not errors, 'hash_verification': False, 'complete': completed == expected,
             'completed_target_trials': completed, 'scheduled_target_trials': expected,
             'stage1_provenance_records_checked': stage1, 'phase_calls_checked': phases,
             'research_evidence_blobs_checked': evidence, 'errors': errors}

@@ -36,7 +36,12 @@ def test_rejected_revision_feedback_changes_next_request_and_keeps_baseline(harn
     assert len({json.loads(path.read_text())["request_sha256"] for path in checkpoints}) == 2
 
 
-def test_invalid_revision_consumes_budget_and_resume_reaches_next_candidate(harness):
+@pytest.mark.parametrize("invalid_code", [
+    "class Toolbox(:\n",
+    "class Toolbox:\n    def __init__(self):\n        pass\n",
+    "return 1\n" + INITIAL_CODE,
+])
+def test_invalid_revision_consumes_budget_and_resume_reaches_next_candidate(harness, invalid_code):
     runner, agent, run = harness
     config = {**SMALL, "revisions": 2, "population": 1}
     original = agent.ask
@@ -48,7 +53,7 @@ def test_invalid_revision_consumes_budget_and_resume_reaches_next_candidate(harn
             payload = json.loads(kwargs["prompt"].split("INPUT JSON:\n", 1)[1])
             if not payload["prior_attempts"]:
                 attempts.append("invalid")
-                return {"toolbox.py": "class Toolbox(:\n", "skill.md": "incomplete"}
+                return {"toolbox.py": invalid_code, "skill.md": "incomplete"}
             if fail_once:
                 fail_once = False
                 raise RuntimeError("simulated interruption after invalid candidate")
@@ -121,6 +126,48 @@ def test_invalid_candidate_does_not_hide_immutable_artifact_change(tmp_path):
         research._candidate({**proposal, "toolbox.py": STAGE1_CODE}, tmp_path)
 
 
+@pytest.mark.parametrize("invalid_code", [
+    "return 1\n",
+    "break\n",
+    "def helper(value, value):\n    pass\n",
+    "def helper():\n    nonlocal missing\n",
+])
+def test_candidate_rejects_compile_errors_before_writing_toolbox(tmp_path, invalid_code):
+    candidate, outcome = research._candidate(
+        {"toolbox.py": invalid_code + INITIAL_CODE, "skill.md": "notes"}, tmp_path)
+    assert candidate is None
+    assert outcome["status"] == "invalid_candidate"
+    assert "Invalid proposed toolbox" in outcome["reason"]
+    assert json.loads((tmp_path / "validation.json").read_text()) == outcome
+    assert not (tmp_path / "toolbox").exists()
+
+
+@pytest.mark.parametrize("before,after,body", [
+    ("old", "new", "-old\n\\ No newline at end of file\n+new\n\\ No newline at end of file\n"),
+    ("old\n", "new", "-old\n+new\n\\ No newline at end of file\n"),
+    ("old", "new\n", "-old\n\\ No newline at end of file\n+new\n"),
+    ("old\n", "new\n", "-old\n+new\n"),
+    ("same", "same\n", "-same\n\\ No newline at end of file\n+same\n"),
+    ("same\n", "same", "-same\n+same\n\\ No newline at end of file\n"),
+    ("", "new", "+new\n\\ No newline at end of file\n"),
+    ("old", "", "-old\n\\ No newline at end of file\n"),
+    ("old\nlast", "new\nlast", "-old\n+new\n last\n\\ No newline at end of file\n"),
+    ("same", "same", ""),
+])
+def test_changes_preserves_diff_lines_and_final_newline_information(tmp_path, before, after, body):
+    source = tmp_path / "skill.md"
+    source.write_text(before)
+    proposal = {"skill.md": after}
+    diff = research._changes(tmp_path, proposal)["skill.md"]
+    if body:
+        assert diff.startswith("--- current/skill.md\n+++ candidate/skill.md\n@@ ")
+        assert diff.split("\n", 3)[3] == body
+    else:
+        assert diff == ""
+    assert source.read_text() == before
+    assert proposal == {"skill.md": after}
+
+
 def _rollout_with_images(out):
     public = out / "public"
     public.mkdir(parents=True)
@@ -162,17 +209,25 @@ def test_every_screen_rollout_gets_image_and_full_motion_summary(tmp_path):
     assert "SECRET" not in json.dumps(payload)
 
 
-def test_public_summary_never_reads_private_trace_or_image(tmp_path):
+@pytest.mark.parametrize("use_symlink", [False, True])
+def test_public_summary_never_reads_private_trace_or_image(tmp_path, use_symlink):
     out = tmp_path / "trial"
     (out / "public").mkdir(parents=True)
     private = out / "private"
     private.mkdir()
-    (private / "metrics.json").write_text("NOT JSON AND MUST NOT BE READ")
+    trace = private / "metrics.json"
+    trace.write_text("NOT JSON AND MUST NOT BE READ")
     image = private / "truth.png"
     Image.new("RGB", (20, 20), "red").save(image)
-    result = summarize_public_evidence({"robot_trace_path": str(private / "metrics.json"),
-                                       "keyframes": [str(image)]}, str(out))
+    if use_symlink:
+        (out / "public/trace.jsonl").symlink_to(trace)
+        (out / "public/frame.png").symlink_to(image)
+        trace, image = out / "public/trace.jsonl", out / "public/frame.png"
+    result = summarize_public_evidence({"robot_trace_path": str(trace), "keyframes": [str(image)],
+        "read_images": [str(image)], "action_images": [{"path": str(image), "sim_time": 0}]}, str(out))
     assert result["motion_summary"]["samples"] == 0
+    assert "robot_trace" not in result
+    assert result["keyframes"] == result["read_images"] == result["action_images"] == []
     assert result["phase_images"] == []
     assert not (out / "public/research_contact_sheet.jpg").exists()
 

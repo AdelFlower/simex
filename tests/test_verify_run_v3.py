@@ -1,4 +1,4 @@
-"""Offline artifact audits catch tampering without rerunning robot experiments."""
+"""Offline audits check accounting and protocol rules without content hashes."""
 import copy
 import json
 from pathlib import Path
@@ -69,6 +69,29 @@ def test_partial_cycle_and_legacy_records_are_safe_to_audit(saved_run):
     assert verify_run.main(['--run', str(root)]) == 2
 
 
+def test_outdated_hash_metadata_is_ignored_by_offline_audit(saved_run):
+    source_history(saved_run)
+
+    def change_hashes(value):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                if key.endswith("sha256"):
+                    value[key] = "outdated hash"
+                else:
+                    change_hashes(item)
+        elif isinstance(value, list):
+            for item in value:
+                change_hashes(item)
+
+    for path in saved_run.rglob("*.json"):
+        record = json.loads(path.read_text())
+        change_hashes(record)
+        save(path, record)
+    result = verify_run.verify(saved_run)
+    assert result["integrity_ok"]
+    assert result["hash_verification"] is False
+
+
 def test_replay_tasks_must_match_frozen_historical_records(saved_run):
     record, _, cycle = source_history(saved_run)
     assert verify_run.verify(saved_run)['integrity_ok']
@@ -92,13 +115,13 @@ def test_completed_new_cycle_requires_its_integrity_artifacts(saved_run):
 
 
 @pytest.mark.parametrize('artifact,expected', [
-    ('script', 'successful script hash changed'),
-    ('toolbox', 'successful toolbox hash changed'),
-    ('result', 'successful result hash changed'),
-    ('request', 'task/toolbox/source-engine provenance differs'),
+    ('script', None),
+    ('toolbox', None),
+    ('result', 'historical success was not an executed success'),
+    ('request', 'task/source-engine provenance differs'),
     ('missing_script', 'missing or invalid provenance artifact'),
 ])
-def test_historical_success_artifact_tampering_is_detected(saved_run, artifact, expected):
+def test_history_audit_uses_protocol_rules_without_hash_verification(saved_run, artifact, expected):
     record, _, _ = source_history(saved_run)
     origin = record['first_success']
     if artifact == 'script':
@@ -117,7 +140,11 @@ def test_historical_success_artifact_tampering_is_detected(saved_run, artifact, 
         save(path, request)
     else:
         Path(origin['script_path']).unlink()
-    assert any(expected in error for error in verify_run.verify(saved_run)['errors'])
+    errors = verify_run.verify(saved_run)['errors']
+    if expected is None:
+        assert not errors
+    else:
+        assert any(expected in error for error in errors)
 
 
 @pytest.mark.parametrize('change,expected', [
@@ -145,7 +172,7 @@ def test_call_settings_must_match_frozen_phase_settings(saved_run, change, expec
     assert any(expected in error for error in verify_run.verify(saved_run)['errors'])
 
 
-def test_existing_target_accounting_fixed_replay_and_frozen_capabilities_remain_checked(harness):
+def test_target_accounting_and_fixed_replay_remain_checked_without_hashes(harness):
     runner, agent, run = harness
     research.discover(runner, agent, run, SMALL)
     research.adapt(runner, agent, run, SMALL)
@@ -160,4 +187,6 @@ def test_existing_target_accounting_fixed_replay_and_frozen_capabilities_remain_
     replay.write_text(original)
     frozen = run / 'frozen/stage1/skill.md'
     frozen.write_text('Changed frozen skill\n')
-    assert any('frozen capability modified' in error for error in verify_run.verify(run)['errors'])
+    assert verify_run.verify(run)['integrity_ok']
+    frozen.unlink()
+    assert any('frozen capability file missing' in error for error in verify_run.verify(run)['errors'])

@@ -8,7 +8,7 @@ from PIL import Image
 
 from simex import research
 from simex.agent import AgentError, AgentTransportError
-from simex.research_context import (ContextError, MAX_IMAGES, MAX_PROMPT_CHARS,
+from simex.research_context import (ContextError, MAX_IMAGES, MAX_INTERACTIONS, MAX_PROMPT_CHARS,
     MAX_READ_ROUNDS, READ_CHARS, SUMMARY_CHARS, ResearchContext, apply_source_edits, dumps)
 
 
@@ -136,20 +136,159 @@ def test_private_fields_never_enter_public_packet_or_assets(tmp_path):
         ctx.read([{"id": str(tmp_path.parent / "private/state.json")}])
 
 
+def public_rollout_with_raw_evidence(tmp_path):
+    public = tmp_path / "trial" / "public"
+    public.mkdir(parents=True)
+    states = [{"sim_time": i, "ee_position": [.4, .2, .3], "gripper_width": .08,
+               "joints": [0.] * 7, "joint_velocities": [.812345 if i == 10 else 0.] + [0.] * 6}
+              for i in range(32)]
+    trace = public / "robot_trace.jsonl"
+    trace.write_text("\n".join(json.dumps({**state, "private_metrics": "SECRET_TARGET"}) for state in states))
+    images = []
+    for i in range(4):
+        image = public / f"frame_{i}.png"
+        Image.new("RGB", (8, 8), (i * 40, 20, 30)).save(image)
+        images.append(str(image))
+    return {"status": "failed", "success": False, "output_dir": str(public.parent),
+        "public_evidence": {"status": "failed", "stdout": "", "robot_trace_path": str(trace),
+            "trace_tail": states[-3:], "keyframes": images[:2], "read_images": [images[2]],
+            "action_images": [{"path": images[3], "sim_time": 5, "action": 0,
+                               "method": "move_ee", "phase": "before", "private_metrics": "SECRET_TARGET"}],
+            "actions": []}}, states, images
+
+
+def read_all_text(context, identifier):
+    chunks, offset = [], 0
+    while True:
+        replies, _ = context.read([{"id": identifier, "offset": offset, "limit": READ_CHARS}])
+        page = replies[0]
+        assert len(dumps(replies)) <= READ_CHARS
+        chunks.append(page["text"])
+        if page["end"] == page["total_chars"]:
+            return "".join(chunks)
+        assert page["end"] > offset
+        offset = page["end"]
+
+
+def test_public_raw_evidence_remains_readable_with_summaries_and_cached_results(tmp_path):
+    result, states, originals = public_rollout_with_raw_evidence(tmp_path)
+    original_result = copy.deepcopy(result)
+    public_result = research._public(result)
+    # Exercise both the new cache and migration from the older summary-only cache.
+    assert research._public(result) == public_result
+    cache_path = Path(result["output_dir"]) / "public/research_evidence.json"
+    cache = json.loads(cache_path.read_text())
+    cache["source_metadata"]["version"] = 2
+    cache["summary"].pop("robot_trace")
+    cache_path.write_text(json.dumps(cache))
+    assert research._public(result) == public_result
+    assert result == original_result
+    evidence = public_result["evidence"]
+    assert evidence["robot_trace"] == states
+    assert evidence["trace_tail"] == states[-3:]
+    assert evidence["motion_summary"]["initial"]["joint_velocities"] == [0.] * 7
+    assert evidence["motion_summary"]["final"]["joint_velocities"] == [0.] * 7
+    payload = {"target": public_result}
+    defaults = research._images(payload)
+    assert defaults == evidence["phase_images"]
+    assert set(research._images(payload, include_all=True)) == set(defaults + originals)
+    context = ResearchContext(payload, research._images(payload, include_all=True),
+                              default_image_paths=defaults)
+    context.persist(tmp_path / "context")
+    packet = context.summary["target"]["evidence"]
+    assert json.loads(read_all_text(context, packet["robot_trace"]["evidence_id"])) == states
+    assert json.loads(read_all_text(context, packet["trace_tail"]["evidence_id"])) == states[-3:]
+    for name, paths in (("keyframes", originals[:2]), ("read_images", originals[2:3]),
+                        ("action_images", originals[3:])):
+        catalog = json.loads(read_all_text(context, packet[name]["evidence_id"]))
+        assert len(catalog) == len(paths)
+        for entry, path in zip(catalog, paths):
+            identifier = (entry["path"] if name == "action_images" else entry)["evidence_id"]
+            replies, requested = context.read([{"id": identifier}])
+            _, attached = context.prompt("Inspect the original frame.", replies=replies, image_ids=requested)
+            assert len(attached) == 1
+            assert Path(attached[0]).read_bytes() == Path(path).read_bytes()
+    assert "SECRET_TARGET" not in dumps(context.summary)
+    assert all("SECRET_TARGET" not in asset.get("text", "") for asset in context.assets.values())
+
+
+def test_ask_reads_raw_trace_then_attaches_requested_original_frame(tmp_path):
+    result, _, originals = public_rollout_with_raw_evidence(tmp_path)
+    payload = {"target": research._public(result)}
+    sheet = Path(payload["target"]["evidence"]["phase_images"][0]).read_bytes()
+    original_image = Path(originals[2]).read_bytes()
+
+    class Reader:
+        count = 0
+
+        def ask(self, prompt, images, **kwargs):
+            self.count += 1
+            assert len(prompt) < MAX_PROMPT_CHARS
+            assert len(images) == 1
+            packet = unpack(prompt)
+            meta = packet["_research_context"]
+            if self.count == 1:
+                assert Path(images[0]).read_bytes() == sheet
+                evidence = packet["target"]["evidence"]
+                return {"evidence_requests": [
+                    {"id": evidence["robot_trace"]["evidence_id"], "find": '"sim_time":10', "limit": 500},
+                    {"id": evidence["read_images"]["evidence_id"]}]}
+            if self.count == 2:
+                assert Path(images[0]).read_bytes() == sheet
+                assert "0.812345" in meta["read_results"][0]["text"]
+                catalog = json.loads(meta["read_results"][1]["text"])
+                self.image_id = catalog[0]["evidence_id"]
+                return {"evidence_requests": [{"id": self.image_id}],
+                        "notes": "The intermediate joint velocity is absent from the endpoint summary."}
+            assert self.count == 3
+            assert meta["attached_images"][0]["id"] == self.image_id
+            assert Path(images[0]).read_bytes() == original_image
+            return {"aligned": False, "reason": "Reviewed the intermediate sample and original frame."}
+
+    agent = Reader()
+    answer = research._ask(agent, tmp_path / "decision.json", "align", "Inspect the public evidence.", payload)
+    assert answer["aligned"] is False
+    assert agent.count == 3
+
+
+def test_large_image_catalogs_and_traces_keep_the_overview_bounded(tmp_path):
+    payload, images = large_evidence(tmp_path)
+    states = [{"sim_time": i, "joints": [i / 100] * 7} for i in range(160)]
+    for record in payload["results"]:
+        record["evidence"].update(keyframes=images * 40, robot_trace=states)
+    context = ResearchContext(payload, images, default_image_paths=images[:MAX_IMAGES])
+    context.persist(tmp_path / "catalog_context")
+    prompt, attached = context.prompt("Inspect public motion and frames.")
+    assert len(prompt) < MAX_PROMPT_CHARS
+    assert len(dumps(context.summary)) <= SUMMARY_CHARS
+    assert len(attached) == MAX_IMAGES
+    for record in context.summary["results"]:
+        evidence = record["evidence"]
+        assert evidence["keyframes"]["kind"] == "image_catalog"
+        assert evidence["keyframes"]["count"] == 480
+        assert evidence["robot_trace"]["count"] == len(states)
+    evidence = context.summary["results"][-1]["evidence"]
+    catalog = json.loads(read_all_text(context, evidence["keyframes"]["evidence_id"]))
+    assert len(catalog) == 480
+    assert all(entry["evidence_id"] in context.image_ids for entry in catalog)
+    assert json.loads(read_all_text(context, evidence["robot_trace"]["evidence_id"])) == states
+
+
 def test_interrupted_read_round_resumes_without_repeating_completed_turn(tmp_path):
     class Interactive:
         count = 0
         fail = True
         calls = []
         def ask(self, role, prompt, images=None):
-            self.count += 1
             self.calls.append(prompt)
             payload = unpack(prompt)
             if not payload["_research_context"]["read_results"]:
+                self.count += 1
                 return {"evidence_requests": [{"id": payload["script"]["evidence_id"], "find": "BUG_LINE"}],
                         "notes": "Read the failure site."}
             if self.fail:
                 raise AgentTransportError("connection interrupted")
+            self.count += 1
             assert "BUG_LINE" in payload["_research_context"]["read_results"][0]["text"]
             return {"aligned": True, "reason": "Observed in the requested source."}
 
@@ -158,18 +297,27 @@ def test_interrupted_read_round_resumes_without_repeating_completed_turn(tmp_pat
     payload = {"script": "# code\n"*1_000 + "BUG_LINE"}
     with pytest.raises(AgentTransportError):
         research._ask(agent, target, "align", "Diagnose.", payload)
-    assert agent.count == 3  # first read, failed continuation, one transport retry
+    assert agent.count == 1  # Only the completed read is charged.
+    assert len(agent.calls) == 7  # One read, then one connection attempt plus five retries.
     assert (tmp_path / "decision.context/turn_00.json").exists()
     assert not target.exists()
+    turn_path = tmp_path / "decision.context/turn_00.json"
+    turn = json.loads(turn_path.read_text())
+    turn["request_sha256"] = "outdated hash"
+    turn_path.write_text(json.dumps(turn))
+    manifest_path = tmp_path / "decision.context/manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["input_sha256"] = manifest["overview_sha256"] = "outdated hash"
+    manifest_path.write_text(json.dumps(manifest))
     agent.fail = False
     answer = research._ask(agent, target, "align", "Diagnose.", payload)
-    assert answer["aligned"] and agent.count == 4
-    assert agent.calls[1] == agent.calls[2] == agent.calls[3]
+    assert answer["aligned"] and agent.count == 2
+    assert len(set(agent.calls[1:])) == 1
     assert research._ask(agent, target, "align", "Diagnose.", payload) == answer
-    assert agent.count == 4
-    with pytest.raises(research.ResearchError, match="input changed"):
-        research._ask(agent, target, "align", "Diagnose.", {"script": payload["script"] + "changed"})
-    assert agent.count == 4
+    assert agent.count == 2
+    assert research._ask(agent, target, "align", "Diagnose.",
+                         {"script": payload["script"] + "changed"}) == answer
+    assert agent.count == 2
 
 
 def test_nontransport_errors_do_not_trigger_resampling(tmp_path):
@@ -185,6 +333,7 @@ def test_nontransport_errors_do_not_trigger_resampling(tmp_path):
 
 
 def test_read_round_limit_is_durable_and_never_runs_a_rollout(tmp_path):
+    assert MAX_INTERACTIONS == MAX_READ_ROUNDS + 1 == 20
     class Endless:
         count = 0
         def ask(self, prompt, **kwargs):
@@ -198,7 +347,31 @@ def test_read_round_limit_is_durable_and_never_runs_a_rollout(tmp_path):
         assert agent.count == MAX_READ_ROUNDS + 1
 
 
-def test_frozen_image_change_invalidates_completed_decision(tmp_path):
+def test_twentieth_interaction_can_decide_after_nineteen_bounded_reads(tmp_path):
+    class Reader:
+        count = 0
+        def ask(self, prompt, **kwargs):
+            value = unpack(prompt)
+            assert len(prompt) <= MAX_PROMPT_CHARS - 1_000
+            remaining = value["_research_context"]["read_rounds_remaining"]
+            assert remaining == MAX_READ_ROUNDS - self.count
+            self.count += 1
+            if remaining == 0:
+                return {"aligned": True}
+            start = (self.count - 1) * 4
+            return {"evidence_requests": [
+                {"id": item["evidence_id"], "limit": 4000}
+                for item in value["scripts"][start:start + 4]],
+                "notes": "Detailed observations. " * 90}
+
+    agent = Reader()
+    payload = {"scripts": [f"# source {i}\n" + "x" * 6000 for i in range(76)]}
+    result = research._ask(agent, tmp_path / "decision.json", "align", "Compare the evidence.", payload)
+    assert result == {"aligned": True}
+    assert agent.count == 20
+
+
+def test_image_hash_change_does_not_repeat_completed_decision(tmp_path):
     frame = tmp_path / "frame.png"
     Image.new("RGB", (8, 8), "red").save(frame)
     class Final:
@@ -211,8 +384,7 @@ def test_frozen_image_change_invalidates_completed_decision(tmp_path):
     path = tmp_path / "decision.json"
     research._ask(agent, path, "align", "Decide.", payload)
     Image.new("RGB", (8, 8), "blue").save(frame)
-    with pytest.raises(research.ResearchError, match="input changed"):
-        research._ask(agent, path, "align", "Decide.", payload)
+    assert research._ask(agent, path, "align", "Decide.", payload) == {"aligned": True}
     assert agent.count == 1
 
 
@@ -270,7 +442,7 @@ def test_bad_block_edit_consumes_candidate_without_model_retry(tmp_path):
     assert agent.count == 1
 
 
-def test_offline_audit_detects_evidence_and_read_request_tampering(tmp_path):
+def test_offline_audit_checks_evidence_presence_without_hash_verification(tmp_path):
     from scripts.verify_run import verify_contexts
     ctx = ResearchContext({"script": "# immutable\n"*1_000})
     ctx.persist(tmp_path / "decision.context")
@@ -280,7 +452,10 @@ def test_offline_audit_detects_evidence_and_read_request_tampering(tmp_path):
     blob.write_text("changed")
     errors = []
     verify_contexts(tmp_path, errors)
-    assert any("evidence hash changed" in error for error in errors)
+    assert not errors
+    blob.unlink()
+    verify_contexts(tmp_path, errors)
+    assert any("evidence blob missing" in error for error in errors)
 
 
 def test_progress_and_termination_stay_visible_when_rollouts_are_compacted(tmp_path):
