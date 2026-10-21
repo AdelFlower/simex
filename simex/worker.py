@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 from .errors import PolicyRequestError
+from .source_model import SourceModelError
 from .wire import encode
 
 PREFIX = 'SIMEX_RESULT '
@@ -62,7 +63,8 @@ def validate_public_request(method, kwargs):
 def error_response(request, exc):
     return {'id': request.get('id', -1) if isinstance(request, dict) else -1,
             'ok': False, 'error': f'{type(exc).__name__}: {exc}',
-            'error_kind': 'policy_request' if isinstance(exc, PolicyRequestError) else 'infrastructure'}
+            'error_kind': ('source_model' if isinstance(exc, SourceModelError) else
+                           'policy_request' if isinstance(exc, PolicyRequestError) else 'infrastructure')}
 
 
 class Recorder:

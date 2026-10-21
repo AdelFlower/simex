@@ -24,4 +24,10 @@ tests/*
 !tests/test_stage1_continuation.py
 !tests/test_source_actuator_calibration.py
 !tests/test_temporal_predicates.py
+!tests/test_supplied_skill_stage2.py
+!tests/test_source_model_code.py
 direct_plate/
+!simex/skills/direct_plate/
+!simex/skills/direct_plate/*.py
+!simex/skills/direct_plate/*.md
+!simex/skills/direct_plate/*.json

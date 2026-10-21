@@ -21,6 +21,7 @@ from .scoring import score
 from .storage import atomic_json, digest, toolbox_hash
 from .tasks import calibrated_scene
 from .wire import encode, decode
+from .source_model import SourceModelError, check_model, model_hash
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_METHODS = {'observe', 'state', 'ik', 'move_joints', 'move_ee', 'gripper', 'wait'}
@@ -61,6 +62,8 @@ class Worker:
             args = {'headless': True}
             if engine == 'isaac':
                 args['usd_path'] = config.get('isaac_asset', '/home/kemove/DexGarmentLab/Assets/Robots/franka/franka.usd')
+            elif config.get('source_model'):
+                args.update(source_model=config['source_model'], max_sim_time=config.get('max_sim_time', 120))
             self.call('initialize', args, timeout=600)
         except BaseException:
             # A partially constructed Worker is never registered with Runner.
@@ -84,7 +87,8 @@ class Worker:
             if result['id'] == ident:
                 if not result['ok']:
                     kind = result.get('error_kind', 'infrastructure')
-                    error = PolicyRequestError if kind == 'policy_request' else InfrastructureError
+                    error = (SourceModelError if kind == 'source_model' else
+                             PolicyRequestError if kind == 'policy_request' else InfrastructureError)
                     raise error(result['error'])
                 return decode(result['result'])
         raise InfrastructureError('Worker timeout')
@@ -164,10 +168,22 @@ class Runner:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.workers = {}
 
-    def worker(self, engine):
-        if engine not in self.workers:
-            self.workers[engine] = Worker(engine, self.config, self.run_dir)
-        return self.workers[engine]
+    def worker(self, engine, source_model=None):
+        config = self.config
+        key = engine
+        if source_model is not None:
+            if engine != 'mujoco':
+                raise ValueError('Source models cannot be applied to the target engine')
+            check_model(source_model)
+            key = (engine, model_hash(source_model))
+            config = {**config, 'source_model': str(Path(source_model).resolve())}
+        # A changed model must not leave old source workers resident.
+        for old in list(self.workers):
+            if old != key and (old == engine or isinstance(old, tuple) and old[0] == engine):
+                self.workers.pop(old).close()
+        if key not in self.workers:
+            self.workers[key] = Worker(engine, config, self.run_dir)
+        return self.workers[key]
 
     def close(self):
         failures = []
@@ -188,14 +204,21 @@ class Runner:
         out = Path(out).resolve()
         out.mkdir(parents=True, exist_ok=True)
         path = out / 'policy_generation.json'
-        if path.exists():
+        strict = self.config.get('protocol') == 'supplied_skill_stage2_v1'
+        if path.exists() and not strict:
             return json.loads(path.read_text())
         settings = getattr(self.agent, 'generation_settings', None)
         signature = hashlib.sha256(json.dumps({'name': task['name'], 'description': task['description'],
                     'toolbox': toolbox_hash(toolbox),
                     'execution_guidance': CAPABILITY_GUIDANCE,
-                    'generation_settings': settings() if callable(settings) else {}},
+                    'generation_settings': settings() if callable(settings) else {},
+                    **({'task': task} if strict else {})},
                     sort_keys=True).encode()).hexdigest()
+        if path.exists():
+            cached = json.loads(path.read_text())
+            if cached.get('signature') != signature:
+                raise ValueError(f'Prepared policy inputs changed: {out}')
+            return cached
         try:
             script = self.generate_policy(task, toolbox, out)
             validate(script)
@@ -209,9 +232,21 @@ class Runner:
         atomic_json(path, result)
         return result
 
-    def rollout(self, engine, task, toolbox, out, script=None, source_config=None):
+    def rollout(self, engine, task, toolbox, out, script=None, source_config=None, source_model=None):
         out, toolbox = Path(out).resolve(), Path(toolbox).resolve()
+        if source_model is not None:
+            if engine != 'mujoco' or source_config:
+                raise ValueError('Code models are source-only and cannot mix with scalar calibration')
+            check_model(source_model)
         out.mkdir(parents=True, exist_ok=True)
+        if source_model is not None or self.config.get('protocol') == 'supplied_skill_stage2_v1':
+            request = {'engine': engine, 'task': task, 'toolbox_sha256': toolbox_hash(toolbox),
+                       'script': script, 'source_model_sha256': model_hash(source_model) if source_model else None,
+                       'source_config': source_config or {}}
+            checkpoint = out / 'runner_request.json'
+            if checkpoint.exists() and json.loads(checkpoint.read_text()) != request:
+                raise ValueError(f'Rollout cache inputs changed: {out}')
+            atomic_json(checkpoint, request)
         existing = out / 'result.json'
         if existing.exists():
             result = json.loads(existing.read_text())
@@ -229,9 +264,10 @@ class Runner:
         private.mkdir(exist_ok=True)
         atomic_json(private / 'scene.json', scene)
         atomic_json(out / 'manifest.json', dict(engine=engine, task=task['name'], toolbox_hash=toolbox_hash(toolbox),
-                    fixed_script=script is not None, source_config=source_config or {}, started_at=time.time()))
+                    fixed_script=script is not None, source_config=source_config or {}, started_at=time.time(),
+                    source_model_sha256=model_hash(source_model) if source_model else None))
         try:
-            worker = self.worker(engine)
+            worker = self.worker(engine, source_model) if source_model else self.worker(engine)
             worker.call('reset', {'scene': scene}, timeout=180)
             worker.call('record', {'directory': str(out / 'public')})
             recording = True
@@ -306,10 +342,11 @@ class Runner:
                                     value = worker.call(method, kwargs)
                                     response = {'ok': True, 'result': encode(value)}
                                 except Exception as exc:
-                                    kind = 'policy_request' if isinstance(exc, PolicyRequestError) else 'infrastructure'
+                                    kind = ('source_model' if isinstance(exc, SourceModelError) else
+                                            'policy_request' if isinstance(exc, PolicyRequestError) else 'infrastructure')
                                     response = {'ok': False, 'error': str(exc) if kind == 'policy_request'
                                                 else 'Physics backend unavailable', 'error_kind': kind}
-                                    if kind == 'infrastructure':
+                                    if kind in ('infrastructure', 'source_model'):
                                         error_box.append(exc)
                                 stream.write((json.dumps(response) + '\n').encode())
                                 stream.flush()
@@ -351,7 +388,12 @@ class Runner:
                     raise error_box[0]
                 if not actual_started:
                     raise InfrastructureError('Policy sandbox exited or timed out before execution handshake')
-            worker.call('wait', {'seconds': 1.0})
+            try:
+                worker.call('wait', {'seconds': 1.0})
+            except PolicyRequestError as exc:
+                if source_model is None:
+                    raise
+                status, reason = 'policy_error', str(exc)
             metrics = worker.call('metrics')
             evidence.update(worker.call('finish'))
             recording = False
@@ -370,6 +412,8 @@ class Runner:
             raise
         except AgentError as exc:
             status, reason = 'generation_error', str(exc)
+        except SourceModelError as exc:
+            status, reason = 'invalid_source_model', str(exc)
         except Exception as exc:
             status = 'interrupted' if actual_started else 'infrastructure_error'
             atomic_json(private / 'failure.json', {'error_type': type(exc).__name__, 'detail': str(exc),

@@ -105,12 +105,15 @@ def _ensure_doctor(runner, agent, run_dir, engines):
 def main(argv=None):
     parser = argparse.ArgumentParser(description='SimEX small-budget MuJoCo → Isaac Sim reproduction')
     commands = parser.add_subparsers(dest='command', required=True)
-    for command in ('doctor', 'rollout', 'discover', 'adapt', 'evaluate', 'report', 'run'):
+    for command in ('doctor', 'rollout', 'discover', 'adapt', 'evaluate', 'report', 'run', 'stage2'):
         sub = commands.add_parser(command)
         sub.add_argument('--run', type=Path, default=Path('runs/small_v6'))
         sub.add_argument('--config', type=Path, default=Path('configs/small.yaml'))
         sub.add_argument('--model', choices=[FIXED_MODEL], default=None,
                          help=f'Model is fixed to {FIXED_MODEL}')
+        if command == 'stage2':
+            sub.add_argument('--source-only', action='store_true',
+                             help='Import and validate the supplied skill in MuJoCo; no model or target calls')
         if command == 'doctor':
             sub.add_argument('--offline', action='store_true', help='Test physics without calling the model')
             sub.add_argument('--engine', choices=['mujoco', 'isaac', 'all'], default='all',
@@ -139,7 +142,18 @@ def main(argv=None):
         atomic_json(run_dir / 'runtime.json', {'config': config, 'python': sys.executable,
                     'codex': agent.codex, 'project': str(ROOT)})
         runner = Runner(agent, run_dir, config)
-        if args.command == 'doctor':
+        if args.command == 'stage2':
+            from . import stage2
+            with research._lock(run_dir):
+                cfg = stage2.initialize(run_dir, config)
+                result = stage2.source_validation(runner, run_dir, cfg)
+            stage2.report(run_dir)
+            if not args.source_only:
+                stage2.adapt(runner, agent, run_dir, config)
+                stage2.report(run_dir)
+                stage2.evaluate(runner, agent, run_dir, config)
+                result = stage2.report(run_dir)
+        elif args.command == 'doctor':
             engines = ('mujoco', 'isaac') if args.engine == 'all' else (args.engine,)
             result = doctor(runner, agent, run_dir, check_agent=not args.offline, engines=engines)
         elif args.command == 'rollout':

@@ -7,8 +7,8 @@ RUN_DIR="${1:-runs/small_v6}"
 CONFIG_PATH="${2:-configs/small.yaml}"
 RESEARCH_COMMAND="${3:-discover}"
 case "$RESEARCH_COMMAND" in
-    discover|adapt|evaluate|run) ;;
-    *) echo "Command must be discover, adapt, evaluate or run" >&2; exit 1 ;;
+    discover|adapt|evaluate|run|stage2) ;;
+    *) echo "Command must be discover, adapt, evaluate, run or stage2" >&2; exit 1 ;;
 esac
 mkdir -p "$RUN_DIR"
 RUN_DIR="$(cd "$RUN_DIR" && pwd)"

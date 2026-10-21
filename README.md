@@ -1,11 +1,83 @@
 # SimEX 本地方法复现
 
-这是根据随附论文实现的 **Franka 单臂、缩小预算的 MuJoCo → Isaac Sim 复现**。优化对象是 `toolbox.py` 与 `skill.md`；每次任务由模型生成新 Python 策略。agent 的初始能力不包含预训练 RL 策略或预写抓盘流程。`direct_plate/` 是独立的固定控制工程演示，不注入 agent 的初始库，也不计为论文式发现结果。
+这是根据随附论文实现的 **Franka 单臂、MuJoCo → Isaac Sim 方法研究**。每次正式任务由模型生成新 Python 策略。原 `discover/adapt/evaluate/run` 流程从基础工具开始；新增 `stage2` 流程明确导入人工提供的 `direct_plate`，只验证 Stage2，不把工程技能计为自主 Stage1 发现。
+
+## 预置 direct_plate 的 Stage2 协议
+
+配置为 [configs/direct_plate_stage2.yaml](configs/direct_plate_stage2.yaml)，实现为
+[simex/stage2.py](simex/stage2.py)。三个任务各五次适应，随后 `skill_transfer` 和
+`skill_stage2` 各五次冻结评估，总计 **45 个目标槽位**；评估场景配对，策略逐次重新生成。
+独立 GPT-6 Astra / medium / 2000 次调用预算，不继承旧运行。模型读取证据也计入调用上限，
+因此上限耗尽可能留下未完成槽位；不会隐式增加预算或补跑中断执行。
+
+能力库位于 [simex/skills/direct_plate](simex/skills/direct_plate)，包含可独立加载的
+`toolbox.py`、`skill.md`、原始 `source_motion.py` 和哈希来源记录。四个接口为
+`estimate_tote()`、`grasp_plate()`、`place_plate(tote)`、`pick_place_plate()`。
+保留原感知、接近、夹取、保持、运输、释放、撤手参数及 640×480 输入；组合接口先定位箱子。
+演示外层的真值放行分支没有进入封装，策略只访问 RGBD 和 RobotAPI。返回值与阶段日志
+表示执行进度，任务成功由受信评分器判定。
+
+下面的命令**仅运行源域接入验收**，不调用模型、不启动 Isaac、不占用目标槽位：
+
+```bash
+.venv/bin/simex stage2 --source-only \
+  --config configs/direct_plate_stage2.yaml --run runs/validation_direct_plate_stage2_20261021_verified
+```
+
+验收使用默认 `far_plate/42` 和原七个回归场景（`far_plate/9..13`、`far_to_near/42`、
+`shifted_single/42`），固定脚本调用 `tb.pick_place_plate()`，必须全部通过
+`released_placement_v1` 才允许适应。它验证预置技能接入，不是学习成绩或未见场景成功率。
+
+正式实验入口如下；本次实现交付不执行此命令：
+
+```bash
+.venv/bin/simex stage2 --config configs/direct_plate_stage2.yaml \
+  --run runs/direct_plate_stage2_20261023
+```
+
+入口顺序为导入冻结 → 八场景源域验收 → 每任务五轮适应 → 两方法冻结评估 → 报告。
+同一命令恢复既有目录时核对配置、实现、能力库、模型、脚本、结果和录像哈希；输入变更
+需要新目录。开始执行但没有持久结果的槽位保持未完成，拒绝自动重跑。没有额外 Isaac
+冒烟试验，也不会在第五轮修复后追加适应。旧研究目录保持停止，旧报告格式仍可读取。
+
+每轮固定实际目标脚本和当时能力库，先通过三个源码扩展点校准源模型：
+`build_xml(scene, baseline_xml)`、`command_duration(command)`、
+`control_step(command, robot_state, elapsed, dt, nominal_ctrl)`。
+允许数值接触几何、质量惯量、摩擦、相机、执行器及控制时序修改；XML 元素拓扑、名称、
+资产、碰撞开关、约束和重力保持固定。控制输出是八维有限电机目标且受执行器范围限制。
+隔离子进程只收到 JSON 数据和模型代码，不能访问仓库、目标实现、其他运行、凭据或网络；
+物理步进、状态采集和评分始终由受信 MuJoCo 工作进程负责。改变几何时，评分使用编译后
+的实际碰撞几何边界。这个有边界的代码接口不等于可任意重写模拟器。
+
+每轮最多三次模型代码修改；初始回放和每次有效修改后的回放都评估，最后一次也不跳过。
+无效模型记录错误并保留最近有效版本。确认对齐必须提供对应阶段的目标/源观测依据，
+“两边都失败”不能单独确认。然后固定源模型，提出四个独立能力修复假设，当前库与有效
+候选均做一次固定脚本回放和五个共享源场景测试，由代理解释并选择，未对齐时说明证据局限。
+模型与能力分别版本化；跨任务重置，第五轮修复进入冻结评估。历史详单可按证据 ID 分页读取。
+
+`report.md/json`、`target_executions.csv` 分别记录验收、流程完成、完整任务成功和
+相对基线改善，附视频、公开阶段、评分细项、代码差异及版本哈希。阶段日志不证明全程持物。
+全部槽位完成不代表复现成功；基线全成功时报告没有测出增益的空间，不临时增加难度。
+
+```bash
+.venv/bin/python -m pytest -q
+.venv/bin/python scripts/verify_run.py --run runs/validation_direct_plate_stage2_20261021_verified
+.venv/bin/python scripts/status.py --run runs/validation_direct_plate_stage2_20261021_verified
+```
+
+本次工程验收：全量 **597 项测试通过**，最终冻结实现的八个源场景 **8/8** 通过完整释放放置。
+七个原始控制函数的语法树一致；保持、运输、释放、撤手阶段记录及评分细项已检查。
+见 [验收报告与视频](runs/validation_direct_plate_stage2_20261021_verified/report.md) 和
+[检查明细](runs/validation_direct_plate_stage2_20261021_verified/audits/acceptance.json)。
+开发期间前两批源域验证均保留，最终报告只统计本目录的八次验收。
+**正式目标执行 0/45，模型调用 0；不据此宣称 Stage2 迁移成功或适应改善。**
+仅源域验收的 `verify_run.py` 会返回 `integrity_ok=true, complete=false`，退出码为 2；
+这是目标阶段尚未启动的预期状态。
 
 ## 2026-10-21 新一轮独立实验
 
 `runs/reproduction_actuator_v1_20261021` 已从原始基础库启动，源域预检和模型连通检查通过，
-正在进行 Stage1。初始库哈希与原始基础库一致，没有继承旧能力库；实际首个探索请求已
+随后已按用户要求停止，未恢复运行。初始库哈希与原始基础库一致，没有继承旧能力库；实际首个探索请求已
 包含完整释放放置参考和可选的持续抬升判据，见 `audits/startup.json`。
 这只是启动与输入检查，尚不能证明学到抓盘放置能力或完成迁移。
 
@@ -19,7 +91,7 @@ python3 scripts/status.py --run runs/reproduction_actuator_v1_20261021
 python3 scripts/verify_run.py --run runs/reproduction_actuator_v1_20261021
 ```
 
-以下保留旧实验的失败结果和新一轮修改的依据。最新完整测试为 572 项通过。
+以下保留旧实验的失败结果和当时修改的依据；该旧版本的测试记录为 572 项通过。
 
 ## 2026-10-21 释放判定修正版
 

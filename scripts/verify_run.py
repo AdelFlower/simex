@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit saved experiment accounting and replay rules without hash verification."""
+"""Audit saved experiment rules; supplied-skill Stage2 also verifies artifact hashes."""
 import argparse
 import hashlib
 import json
@@ -255,6 +255,9 @@ def verify(root):
     manifest = load(root / 'manifest.json')
     ledger = load(root / 'target_ledger.json')['slots']
     cfg = manifest['config']
+    if cfg.get('protocol') == 'supplied_skill_stage2_v1':
+        from simex.stage2 import verify as verify_supplied
+        return verify_supplied(root)
     expected = 3 * cfg['adapt_trials'] + 9 * cfg['eval_trials']
     errors = []
     if len(ledger) != expected:

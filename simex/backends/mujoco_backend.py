@@ -43,6 +43,8 @@ class MujocoBackend:
         self.on_step: Callable[[], None] | None = None
         self._next_callback = 0.25
         self._steps = 0
+        self._hooks = None
+        self._command = None
 
     def _scene_xml(self, scene: dict) -> str:
         path = self.asset_root / "panda.xml"
@@ -143,7 +145,19 @@ class MujocoBackend:
         self.scene = copy.deepcopy(scene)
         self.width = int(scene.get("cameras", {}).get("width", 320))
         self.height = int(scene.get("cameras", {}).get("height", 240))
-        self.model = mujoco.MjModel.from_xml_string(self._scene_xml(scene))
+        xml = self._scene_xml(scene)
+        if self.config.get('source_model'):
+            from simex.source_model import Hooks, validate_xml, SourceModelError
+            self._hooks = Hooks(self.config['source_model'])
+            xml = validate_xml(xml, self._hooks.call('build_xml', scene, xml))
+            try:
+                self.model = mujoco.MjModel.from_xml_string(xml)
+            except Exception as exc:
+                raise SourceModelError(f'Source model does not compile: {exc}') from exc
+            if self.model.nu != 8 or not np.isfinite(self.model.body_mass).all():
+                raise SourceModelError('Invalid source robot interface or inertia')
+        else:
+            self.model = mujoco.MjModel.from_xml_string(xml)
         # MuJoCo combines equal-priority geom friction by max. Scale both
         # participants, so every physical sliding contact responds linearly,
         # including plate/table and plate/fingertip contacts below scale 1.
@@ -263,10 +277,30 @@ class MujocoBackend:
         return {"success": False, "joints": best[1].tolist(), "error": best[2], "orientation_error": best[3]}
 
     def _step(self) -> None:
+        if self._hooks and self._command:
+            from simex.source_model import SourceModelError
+            from simex.errors import PolicyRequestError
+            if self.data.time + self.model.opt.timestep > self.config.get('max_sim_time', 120) + 1e-8:
+                raise PolicyRequestError('Simulation time budget exhausted')
+            values = self._hooks.call('control_step', self._command, self.state(),
+                                     float(self.data.time - self._command_start),
+                                     float(self.model.opt.timestep), self.data.ctrl.tolist())
+            try:
+                control = np.asarray(values, dtype=float)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise SourceModelError('Control hook returned nonnumeric motor targets') from exc
+            limits = self.model.actuator_ctrlrange
+            if (control.shape != (8,) or not np.isfinite(control).all()
+                    or np.any(control < limits[:, 0]) or np.any(control > limits[:, 1])):
+                raise SourceModelError('Control hook must return 8 finite in-range motor targets')
+            self.data.ctrl[:] = control
         mujoco.mj_step(self.model, self.data)
         mujoco.mj_forward(self.model, self.data)
         self._steps += 1
         if not np.all(np.isfinite(self.data.qpos)):
+            if self._hooks:
+                from simex.source_model import SourceModelError
+                raise SourceModelError('Source model produced non-finite simulator state')
             raise RuntimeError("Non-finite simulator state")
         for name, body_id in self._object_ids.items():
             self._max_heights[name] = max(self._max_heights[name], float(self.data.xpos[body_id, 2]))
@@ -287,6 +321,7 @@ class MujocoBackend:
         requested = _finite(joints, 7, "joints")
         target = np.clip(requested, self._limits[:, 0], self._limits[:, 1])
         start = self.data.qpos[self._qpos_indices].copy()
+        duration = self._model_duration('move_joints', duration, joints=target.tolist())
         steps = max(1, math.ceil(self._duration(duration) / self.model.opt.timestep))
         for index in range(1, steps + 1):
             phase = index / steps
@@ -320,6 +355,7 @@ class MujocoBackend:
         self.model.actuator_forcerange[7] = [-2 * force, 2 * force]
         start = float(self.data.ctrl[7])
         target = width / .08 * 255
+        duration = self._model_duration('gripper', duration, width=width, force=force)
         steps = max(1, math.ceil(self._duration(duration) / self.model.opt.timestep))
         for index in range(1, steps + 1):
             self.data.ctrl[7] = start + (target - start) * index / steps
@@ -328,11 +364,26 @@ class MujocoBackend:
 
     def wait(self, seconds: float) -> dict:
         self._ready()
+        seconds = self._model_duration('wait', seconds)
         if float(seconds) == 0:
             return self.state()
         for _ in range(math.ceil(self._duration(seconds) / self.model.opt.timestep)):
             self._step()
         return self.state()
+
+    def _model_duration(self, method, duration, **arguments):
+        if not self._hooks:
+            return duration
+        from simex.source_model import SourceModelError
+        command = {'method': method, 'duration': float(duration), **arguments}
+        value = self._hooks.call('command_duration', command)
+        if (isinstance(value, bool) or not isinstance(value, (float, int))
+                or not math.isfinite(value) or not (0 <= value <= 60)
+                or (method != 'wait' and value < .001)):
+            raise SourceModelError('Invalid model command duration')
+        self._command = {**command, 'duration': value}
+        self._command_start = float(self.data.time)
+        return value
 
     def metrics(self) -> dict:
         self._ready()
@@ -344,8 +395,12 @@ class MujocoBackend:
                              "max_height": self._max_heights[name], "initial_height": self._initial_heights[name],
                              "linear_velocity": velocity[3:].tolist()}
         tote = self.scene.get("tote", {})
+        if self._hooks:
+            from simex.source_geometry import measured_geometry
+            objects, tote = measured_geometry(self.model, self.data, objects, self._object_ids)
         return {"objects": objects, "tote": {"position": tote.get("position", [.4, -.26, 0]),
-                 "inner_size": tote.get("inner_size", [.26, .22, .1]), "yaw": tote.get("yaw", 0)},
+                 "inner_size": tote.get("inner_size", [.26, .22, .1]), "yaw": tote.get("yaw", 0),
+                 **({'bottom_thickness': tote['bottom_thickness']} if 'bottom_thickness' in tote else {})},
                 "sim_time": float(self.data.time), "steps": self._steps,
                 "contact_parameters": self.contact_parameters()}
 
@@ -386,6 +441,10 @@ class MujocoBackend:
                 'plates': per_plate}
 
     def close(self) -> None:
+        if self._hooks is not None:
+            self._hooks.close()
+            self._hooks = None
+        self._command = None
         if self.renderer is not None:
             self.renderer.close()
             self.renderer = None

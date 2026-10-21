@@ -1,0 +1,21 @@
+protocol: supplied_skill_stage2_v1
+stage1_toolbox: simex/skills/direct_plate
+placement_contract: released_placement_v1
+camera_resolution: [640, 480]
+source_calibration_profile: code_v1
+adapt_trials: 5
+repairs: 4
+screen_tasks: 5
+align_attempts: 3
+eval_trials: 5
+seed: 20261023
+model: gpt-6-astra
+reasoning_effort: medium
+stage2_reasoning_effort: medium
+evaluation_reasoning_effort: medium
+agent_timeout: 600
+policy_timeout: 240
+max_sim_time: 120
+max_agent_calls: 2000
+source_policy_workers: 3
+isaac_asset: /home/kemove/DexGarmentLab/Assets/Robots/franka/franka.usd

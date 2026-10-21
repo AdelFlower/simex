@@ -1,0 +1,17 @@
+{
+  "kind": "supplied_engineering_skill",
+  "assumed_stage1": true,
+  "autonomous_discovery": false,
+  "source": "direct_plate/motion.py",
+  "hashes": {
+    "source_motion.py": "50c320ac53c2a295c4562d661061dc5e85735d3f4a45d61578efb3ae77a36ab1",
+    "base_toolbox.py": "ae05ef6f1d63b064aa214edb65bcca184e94bf775060ffbf9f2106e8e900e190",
+    "toolbox.py": "9c5b9e09c12b715cb446ca2d8ecf21c74f20ddcd4e300f578ef8d7924eb788c2",
+    "skill.md": "b8d277f6b5d2a77439e010c4352b2b25aca084adbd35b7075dae2803ca3e36f7"
+  },
+  "camera_resolution": [
+    640,
+    480
+  ],
+  "truth_gate_removed": true
+}

@@ -59,6 +59,11 @@ stage1 = {key: discovery[key] for key in ('process_complete', 'winner', 'full_ta
           'full_task_verified', 'auxiliary_successes', 'agent_count') if key in discovery}
 if discovery and discovery.get('full_task_verified') is False:
     stage1['message'] = '尚未验证完整入箱能力'
+supplied = {}
+if (root / 'supplied_skill.json').exists():
+    supplied = {'assumed_stage1': True, 'autonomous_discovery': False,
+                'source_validation': json.loads((root / 'source_validation.json').read_text())
+                if (root / 'source_validation.json').exists() else {'complete': False}}
 outcomes = Counter()
 activity = Counter()
 coding_sessions = [{"directory": str(path.parent.relative_to(root)), **json.loads(path.read_text())}
@@ -76,6 +81,7 @@ print(json.dumps({'run': str(root), 'process': process,
                   'model_budget_used': len(calls) - network_exempt,
                   'network_failures_exempt': network_exempt,
                   'stage1': stage1,
+                  'supplied_skill': supplied,
                   'coding_sessions': coding_sessions,
                   'target_slots': dict(Counter(x['state'] for x in slots)),
                   'rollout_statuses': dict(outcomes),

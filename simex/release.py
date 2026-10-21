@@ -59,6 +59,8 @@ def release_evidence(scene, metrics, robot, actions, samples):
     output = {}
     for geometry in scene["plates"]:
         name = geometry["name"]
+        geometry = {**geometry, 'radius': metrics.get('objects', {}).get(name, {}).get(
+            'collision_radius', geometry['radius'])}
         item = {"contract": RELEASE_CONTRACT, "released": False, "reason": "no_opening_after_measured_close"}
         output[name] = item
         if opening is None:

@@ -15,6 +15,15 @@ def score(task, metrics, *, samples=None):
 
     def bounds(name):
         obj, geom = objects[name], geometry[name]
+        if 'collision_bounds' in obj:
+            lower = np.asarray(obj['collision_bounds']['min'], dtype=float)
+            upper = np.asarray(obj['collision_bounds']['max'], dtype=float)
+            if (lower.shape != (3,) or upper.shape != (3,) or not np.isfinite([lower, upper]).all()
+                    or np.any(upper < lower)):
+                raise ValueError('Invalid trusted collision bounds')
+            middle = (lower + upper) / 2
+            position = np.r_[rotation.T @ middle[:2] + center[:2], middle[2]]
+            return position, middle[:2], (upper - lower) / 2
         position = np.array(obj['position'])
         q = obj.get('quaternion', [1, 0, 0, 0])
         normal = Rotation.from_quat([q[1], q[2], q[3], q[0]]).as_matrix()[:, 2]

@@ -618,13 +618,18 @@ def _started_without_outcome(out: Path, result: dict | None) -> bool:
 
 
 def _run(runner, engine: str, task: dict, toolbox: Path, out: Path,
-         script: str | None = None, source_config: dict | None = None) -> dict:
+         script: str | None = None, source_config: dict | None = None, source_model=None) -> dict:
     request = {"engine": engine, "task": task, "toolbox_sha256": toolbox_hash(toolbox),
                "script_sha256": _digest(script), "source_config": source_config or {}}
+    if source_model is not None:
+        from .source_model import check_model, model_hash
+        check_model(source_model)
+        request['source_model_sha256'] = model_hash(source_model)
+    strict = source_model is not None or getattr(runner, 'config', {}).get('protocol') == 'supplied_skill_stage2_v1'
     request_path = out / "research_request.json"
     old = _json(request_path)
-    if old is not None and any(old.get(key) != request[key]
-                               for key in ("engine", "task", "source_config")):
+    if old is not None and (old != request if strict else any(old.get(key) != request[key]
+                               for key in ("engine", "task", "source_config"))):
         raise ResearchError(f"Rollout checkpoint input changed: {out}")
     result_path = out / "result.json"
     previous = _json(result_path)
@@ -634,6 +639,9 @@ def _run(runner, engine: str, task: dict, toolbox: Path, out: Path,
     if previous is not None and previous.get("status") != "infrastructure_error":
         if previous.get("failure_kind") == "infrastructure":
             raise ResearchError(f"Infrastructure interrupted this rollout; recover its outcome before continuing: {out}")
+        if getattr(runner, 'config', {}).get('protocol') == 'supplied_skill_stage2_v1':
+            from .stage2 import check_rollout
+            check_rollout(out)
         return previous
     if script is None and not (out / "policy_generation.json").exists():
         _agent_capacity(getattr(runner, "agent", None))
@@ -646,11 +654,15 @@ def _run(runner, engine: str, task: dict, toolbox: Path, out: Path,
         index = max((int(path.stem) for path in archived.glob("*.json")
                      if path.stem.isdigit()), default=-1) + 1
         result_path.replace(archived / f"{index:03d}.json")
+    extra = {'source_model': source_model} if source_model is not None else {}
     result = runner.rollout(engine=engine, task=task, toolbox=toolbox, out=out,
-                            script=script, source_config=source_config)
+                            script=script, source_config=source_config, **extra)
     if not isinstance(result, dict):
         raise ResearchError("Runner did not return a result object")
     _save(result_path, result)
+    if getattr(runner, 'config', {}).get('protocol') == 'supplied_skill_stage2_v1':
+        from .stage2 import seal_rollout
+        seal_rollout(out)
     attempts = out / "research_attempts"
     attempt = len(list(attempts.glob("*.json")))
     _save(attempts / f"{attempt:03d}.json", result)
@@ -695,6 +707,8 @@ def _target(runner, run_dir: Path, slot_key: str, toolbox: Path, out: Path) -> d
             cfg = _json(run_dir / "manifest.json", {}).get("config", {})
             task = with_placement_contract(make_task(slot["task_id"], slot["seed"]),
                                            cfg.get("placement_contract", "legacy_geometry"))
+            if cfg.get('camera_resolution'):
+                task['scene']['cameras'].update(zip(('width', 'height'), cfg['camera_resolution']))
             result = _run(runner, "isaac", task,
                           toolbox, out)
         except BaseException:
@@ -743,7 +757,7 @@ def _tasks_from_response(response: dict, count: int) -> list[dict]:
 
 
 def _suite(runner, tasks: list[dict], toolbox: Path, out: Path,
-           source_config: dict | None = None, script: str | None = None) -> list[dict]:
+           source_config: dict | None = None, script: str | None = None, source_model=None) -> list[dict]:
     def progress(event, **details):
         root = getattr(runner, "run_dir", None)
         if root is not None:
@@ -782,7 +796,7 @@ def _suite(runner, tasks: list[dict], toolbox: Path, out: Path,
                 raise ResearchError(f"Source policy preparation failed: {errors[0]}") from errors[0]
     results = []
     for index, task in enumerate(tasks):
-        result = _run(runner, "mujoco", task, toolbox, out / f"{index:03d}", script, source_config)
+        result = _run(runner, "mujoco", task, toolbox, out / f"{index:03d}", script, source_config, source_model)
         results.append(result)
         activity = result.get("action_summary", {})
         progress("source_rollout_complete", trial=index + 1, scheduled=len(tasks),
@@ -1641,6 +1655,9 @@ def report(run_dir: Path) -> dict:
     manifest = _json(run_dir / "manifest.json")
     if not manifest:
         raise ResearchError(f"No experiment manifest in {run_dir}")
+    if manifest.get('config', {}).get('protocol') == 'supplied_skill_stage2_v1':
+        from .stage2 import report as supplied_report
+        return supplied_report(run_dir)
     from .coding import coding_report
     coding = coding_report(run_dir)
     ledger = _json(run_dir / "target_ledger.json", {"slots": {}})
