@@ -1,0 +1,31 @@
+# Bounded, independent paper-framework reproduction. Never resume an older run
+# with this configuration: curriculum and target slots are frozen on first use.
+population: 2
+cycles: 3
+probes: 8
+focused: 4
+revisions: 2
+discovery_mode: interactive
+coding_max_turns: 40
+coding_max_tests: 10
+replay: 2
+adapt_trials: 5
+repairs: 2
+screen_tasks: 3
+align_attempts: 3
+eval_trials: 5
+seed: 20261020
+agent_timeout: 600
+policy_timeout: 240
+max_sim_time: 120
+model: gpt-6-astra
+reasoning_effort: high
+# Prior max-effort calls spent 9–20 minutes per policy and sometimes timed out.
+# This local reproduction uses high effort for discovery and adaptation.
+stage1_reasoning_effort: high
+stage2_reasoning_effort: high
+evaluation_reasoning_effort: medium
+stage1_agent_timeout: 900
+max_agent_calls: 2000
+source_policy_workers: 3
+isaac_asset: /home/kemove/DexGarmentLab/Assets/Robots/franka/franka.usd

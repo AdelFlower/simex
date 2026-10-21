@@ -8,7 +8,7 @@ import yaml
 from .agent import Agent, FIXED_MODEL
 from .runner import Runner, ROOT
 from .storage import atomic_json
-from .tasks import TASK_IDS, make_task
+from .tasks import TASK_IDS, make_task, with_placement_contract
 from . import research
 
 SMOKE_SCRIPT = '''
@@ -144,7 +144,9 @@ def main(argv=None):
             result = doctor(runner, agent, run_dir, check_agent=not args.offline, engines=engines)
         elif args.command == 'rollout':
             script = args.script.read_text() if args.script else None
-            result = runner.rollout(args.engine, make_task(args.task, args.seed), args.toolbox,
+            task = with_placement_contract(make_task(args.task, args.seed),
+                                           config.get('placement_contract', 'legacy_geometry'))
+            result = runner.rollout(args.engine, task, args.toolbox,
                                     run_dir / 'debug' / args.label, script=script)
         else:
             if args.command == 'run':

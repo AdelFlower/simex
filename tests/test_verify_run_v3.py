@@ -6,6 +6,27 @@ from pathlib import Path
 import pytest
 
 from scripts import verify_run
+from simex.research_limits import MAX_PROMPT_CHARS
+
+
+@pytest.mark.parametrize('chars,valid', [(80_000, True), (MAX_PROMPT_CHARS + 1, False)])
+def test_audit_uses_the_runtime_context_ceiling(tmp_path, chars, valid):
+    prompt = 'x' * chars
+    request = {'phase': 'stage1', 'role': 'discover_code', 'prompt': prompt,
+               'prompt_chars': chars, 'input_chars': chars + 200,
+               'images': [], 'image_count': 0}
+    save(tmp_path / 'agent_calls/00001_discover_code/request.json', request)
+    context = tmp_path / 'evidence.context'
+    save(context / 'manifest.json', {'assets': {}})
+    save(context / 'overview.json', {})
+    save(context / 'turn_000.json', {'request': {'prompt': prompt, 'images': []}})
+    errors = []
+    assert verify_run.verify_phases(tmp_path, {}, errors) == 1
+    verify_run.verify_contexts(tmp_path, errors)
+    assert (not errors) is valid
+    if not valid:
+        assert len(errors) == 2
+        assert all('context budget' in message for message in errors)
 from simex import research
 from test_research import SMALL, harness
 

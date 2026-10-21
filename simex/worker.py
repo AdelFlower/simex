@@ -66,7 +66,7 @@ def error_response(request, exc):
 
 
 class Recorder:
-    def __init__(self, backend, directory):
+    def __init__(self, backend, directory, private_directory=None):
         self.backend = backend
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -83,6 +83,26 @@ class Recorder:
         self.actions = []
         self.action_images = []
         self.video_log = (self.directory / 'video_encoder.log').open('w')
+        self.private_trace = None
+        if private_directory is not None:
+            private_directory = Path(private_directory)
+            private_directory.mkdir(parents=True, exist_ok=True)
+            self.private_trace = (private_directory / 'object_trace.jsonl').open('w')
+
+    def private_sample(self, state):
+        """Passive ground truth for final audit; never returned as public evidence."""
+        if self.private_trace is None:
+            return
+        try:
+            metrics = self.backend.metrics()
+            sample = {'sim_time': state['sim_time'], 'robot': encode(state),
+                      'objects': encode(metrics['objects'])}
+        except Exception as exc:
+            # Preserve missing-data evidence privately without injecting backend
+            # internals into a policy's recording_errors or changing its outcome.
+            sample = {'sim_time': state['sim_time'], 'error': str(exc)}
+        self.private_trace.write(json.dumps(sample) + '\n')
+        self.private_trace.flush()
 
     def capture(self):
         state = self.backend.state()
@@ -92,6 +112,7 @@ class Recorder:
         self.trace.write(json.dumps(encode(state)) + '\n')
         self.trace.flush()
         self.trace_tail = (self.trace_tail + [encode(state)])[-10:]
+        self.private_sample(state)
         try:
             observation = self.backend.observe('overhead')
             rgb = np.ascontiguousarray(observation['rgb'], dtype=np.uint8)
@@ -157,6 +178,8 @@ class Recorder:
         self.capture()
         self.trace.close()
         self.action_trace.close()
+        if self.private_trace is not None:
+            self.private_trace.close()
         if self.video:
             try:
                 self.video.stdin.close()
@@ -200,7 +223,8 @@ def main():
                     recorder = None
                 result = backend.reset(kwargs['scene'])
             elif method == 'record':
-                recorder = Recorder(backend, kwargs['directory'])
+                directory = Path(kwargs['directory'])
+                recorder = Recorder(backend, directory, directory.parent / 'private')
                 backend.on_step = recorder.capture
                 recorder.capture()
                 result = True

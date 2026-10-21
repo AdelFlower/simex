@@ -1,0 +1,33 @@
+# Prospective correction before any target policy executed. The original source
+# study and all its scores remain intact in the parent run.
+stage1_parent: runs/reproduction_20261020
+placement_contract: released_placement_v1
+population: 2
+cycles: 3
+probes: 8
+focused: 4
+revisions: 2
+discovery_mode: interactive
+coding_max_turns: 40
+coding_max_tests: 10
+replay: 2
+adapt_trials: 5
+repairs: 2
+screen_tasks: 3
+align_attempts: 3
+eval_trials: 5
+seed: 20261020
+agent_timeout: 600
+policy_timeout: 240
+max_sim_time: 120
+model: gpt-6-astra
+reasoning_effort: high
+stage1_reasoning_effort: high
+stage2_reasoning_effort: high
+evaluation_reasoning_effort: medium
+stage1_agent_timeout: 900
+# Original budget 2000 minus 480 charged calls (including the cancelled
+# pre-execution target policy request). No budget is refunded or enlarged.
+max_agent_calls: 1520
+source_policy_workers: 3
+isaac_asset: /home/kemove/DexGarmentLab/Assets/Robots/franka/franka.usd

@@ -299,6 +299,8 @@ class Runner:
                                     if method in ('move_joints', 'move_ee', 'gripper', 'wait'):
                                         state = worker.call('state')
                                         requested = float(kwargs.get('seconds', kwargs.get('duration', 1)))
+                                        if engine == 'mujoco' and method in ('move_joints', 'move_ee'):
+                                            requested += scene['physics'].get('arm_settle_s', 0.)
                                         if state['sim_time'] + requested > self.config.get('max_sim_time', 120):
                                             raise PolicyRequestError('Simulation time budget exhausted')
                                     value = worker.call(method, kwargs)
@@ -353,7 +355,14 @@ class Runner:
             metrics = worker.call('metrics')
             evidence.update(worker.call('finish'))
             recording = False
-            success = status == 'completed' and score(task, metrics)
+            from .release import release_evidence
+            trace_path = private / 'object_trace.jsonl'
+            samples = [json.loads(line) for line in trace_path.read_text().splitlines()] if trace_path.exists() else []
+            actions = evidence.get('actions', [])
+            final_robot = actions[-1].get('after', {}) if actions else {}
+            metrics['release_evidence'] = release_evidence(
+                scene, metrics, final_robot, actions, samples)
+            success = status == 'completed' and score(task, metrics, samples=samples)
             status = 'success' if success else ('failed' if status == 'completed' else status)
         except InvalidPolicy as exc:
             status, reason = 'invalid_policy', str(exc)
@@ -382,7 +391,9 @@ class Runner:
         if metrics is not None:
             atomic_json(private / 'metrics.json', metrics)
         stdout_path = out / 'policy_stdout.log'
-        stdout = stdout_path.read_text()[-16000:] if stdout_path.exists() else ''
+        # ResearchContext provides bounded, paged access. Truncating here loses
+        # early failures and can cut the first retained line inside a dict.
+        stdout = stdout_path.read_text() if stdout_path.exists() else ''
         if not reason and status not in ('success', 'failed'):
             reason = stdout[-2000:]
         evidence.update(status=status, success=status == 'success', reason=reason, stdout=stdout)

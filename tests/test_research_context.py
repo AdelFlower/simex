@@ -9,7 +9,8 @@ from PIL import Image
 from simex import research
 from simex.agent import AgentError, AgentTransportError
 from simex.research_context import (ContextError, MAX_IMAGES, MAX_INTERACTIONS, MAX_PROMPT_CHARS,
-    MAX_READ_ROUNDS, READ_CHARS, SUMMARY_CHARS, ResearchContext, apply_source_edits, dumps)
+    MAX_READ_ROUNDS, READ_CHARS, SUMMARY_CHARS, ResearchContext, apply_source_edits, dumps,
+    prepare_edit_context)
 
 
 def unpack(prompt):
@@ -83,8 +84,11 @@ def test_paged_text_is_exact_including_escaped_logs_and_unicode(tmp_path):
     assert replies[0]["complete"] is False  # complete means the WHOLE document
 
 
-def test_whole_current_library_survives_every_turn_with_rejection_history(tmp_path):
+@pytest.mark.parametrize("source_chars", [None, 63_000])
+def test_whole_current_library_survives_every_turn_with_rejection_history(tmp_path, source_chars):
     payload, images = large_evidence(tmp_path)
+    if source_chars is not None:
+        payload["toolbox"]["toolbox.py"] = "#" * source_chars
     payload["prior_attempts"] = [{"revision": 0, "accepted": False, "reason": "tracking failed",
         "candidate_toolbox": payload["toolbox"], "baseline_results": payload["results"][:4],
         "results": payload["results"][:4]}]
@@ -108,6 +112,55 @@ def test_whole_current_library_survives_every_turn_with_rejection_history(tmp_pa
             replies=replies, reads_so_far=[{"id": identifier, "offset": 0, "end": 100}]*16)
         assert unpack(followup)["toolbox"] == payload["toolbox"]
         assert len(followup) < MAX_PROMPT_CHARS
+
+
+@pytest.mark.parametrize("role", ["align", "repair_hypotheses"])
+@pytest.mark.parametrize("source_chars", [1_000, 40_000, 70_000])
+def test_readonly_analysis_keeps_bounded_code_without_edit_protocol(tmp_path, role, source_chars):
+    payload, images = large_evidence(tmp_path)
+    payload["toolbox"]["toolbox.py"] = "#" * source_chars
+    instruction = "Inspect the current implementation and public observations."
+    prepared, pinned, edits = prepare_edit_context(role, instruction, payload)
+    assert prepared == instruction and edits is False
+    context = ResearchContext(payload, images, pinned_keys=pinned, instruction=prepared)
+    context.persist(tmp_path / "analysis")
+    for round_index in (0, 1, MAX_READ_ROUNDS):
+        prompt, attachments = context.prompt(prepared, round_index=round_index, notes="Findings" * 250)
+        packet = unpack(prompt)
+        assert len(prompt) < MAX_PROMPT_CHARS and len(attachments) <= MAX_IMAGES
+        assert "Output override: use exact block edits" not in prompt
+        if source_chars < 64_000:
+            assert packet["toolbox"] == payload["toolbox"]
+        else:
+            assert read_all_text(context, packet["toolbox"]["toolbox.py"]["evidence_id"]) == payload["toolbox"]["toolbox.py"]
+
+
+@pytest.mark.parametrize("role,answer", [
+    ("align", {"aligned": False, "source_config": {}, "reason": "Different retention."}),
+    ("repair_hypotheses", {"hypotheses": ["Contact geometry", "Closure control"]}),
+])
+def test_readonly_ask_preserves_code_across_evidence_reads_and_returns_decision(tmp_path, role, answer):
+    payload, _ = large_evidence(tmp_path)
+    payload["toolbox"]["toolbox.py"] += "#" * 10_000
+
+    class Reader:
+        count = 0
+
+        def ask(self, prompt, images, **kwargs):
+            self.count += 1
+            packet = unpack(prompt)
+            assert packet["toolbox"] == payload["toolbox"]
+            assert "Output override: use exact block edits" not in prompt
+            if self.count == 1:
+                return {"evidence_requests": [{"id": packet["results"][0]["evidence"]["stdout"]["evidence_id"],
+                                               "find": "STOP tracking error"}],
+                        "notes": "Keep helper semantics visible while inspecting execution."}
+            assert "STOP tracking error" in packet["_research_context"]["read_results"][0]["text"]
+            return answer
+
+    agent = Reader()
+    assert research._ask(agent, tmp_path / "decision.json", role, "Return the requested decision.", payload) == answer
+    assert agent.count == 2
 
 
 @pytest.mark.parametrize("read_request", [
@@ -168,6 +221,87 @@ def read_all_text(context, identifier):
             return "".join(chunks)
         assert page["end"] > offset
         offset = page["end"]
+
+
+@pytest.mark.parametrize("context_mode", ["research", "coding_initial", "coding_read", "coding_test"])
+def test_dense_rollout_indexes_fit_beside_nearly_full_pinned_library(tmp_path, monkeypatch, context_mode):
+    """Regression: v6 stopped after 12 trials before asking for any revision."""
+    # Keep testing the original tight budget: extra capacity must not replace
+    # lossless fallback handling when source eventually grows again.
+    monkeypatch.setattr("simex.research_context.MAX_PROMPT_CHARS", 64_000)
+    payload, images = large_evidence(tmp_path)
+    payload["toolbox"] = {"toolbox.py": "# initial helper\n" * 1550,
+                          "skill.md": "Robot API reference\n" * 60}
+    for index, row in enumerate(payload["results"]):
+        evidence = row["evidence"]
+        evidence["action_summary"].update(
+            close_commands=1, open_commands=0, min_tcp_height_m=.02,
+            tcp_rise_after_close_m=.07, command_stage="closed_then_lifted",
+            last_motion_rejection={"source": "policy_stdout", "reason": "FAIL " * 60},
+            termination={"kind": "policy_returned", "reason": "STOP " * 60})
+        evidence.update(
+            keyframes=images, read_images=images, action_images=images,
+            robot_trace=[{"sim_time": i, "ee_position": [.4, .2, .3]} for i in range(30)],
+            trace_tail=[{"sim_time": i} for i in range(5)],
+            recording_errors=[], evidence_errors=[])
+        row["execution"]["script"] += f"\n# unique policy {index}\n"
+    instruction = "Preserve current source and inspect the experiment evidence. " * 70
+    interactive = context_mode.startswith("coding_")
+    if interactive:
+        from simex.coding import INSTRUCTIONS
+        from simex.tasks import make_task
+        instruction = INSTRUCTIONS + "\n\n" + research.TOOLBOX_CONTRACT
+        # Exact near-limit library plus scene/task catalogs from the real protocol.
+        payload["toolbox"] = {"toolbox.py": "#" * 29_700, "skill.md": "Robot API"}
+        tasks = [make_task("far_plate", i) for i in range(12)]
+        payload["tasks"] = tasks[:4]
+        payload["probe_examples"] = [{"task": task, "result": result}
+            for task, result in zip(tasks[4:], payload["results"][4:])]
+        payload["results"] = payload["results"][:4]
+        payload["source_scene_template"] = tasks[0]["scene"]
+        payload["source_scene_templates"] = {f"scene_{i}": task["scene"] for i, task in enumerate(tasks[:3])}
+        payload["read_history"] = {"read_operations": 24, "consecutive_reads": 24, "omitted_ids": 0,
+            "recent": [{"id": "text_" + f"{i:032d}", "ranges": [[0, 8000]], "requests": 2,
+                        "repeated_reads": 1, "empty_pages": 0, "omitted_ranges": 0} for i in range(12)]}
+        if context_mode == "coding_read":
+            payload["last_feedback"] = {"status": "read", "reads": [
+                {"id": "text_" + str(i) * 32, "offset": 0, "end": 2000} for i in range(4)]}
+            payload["coding_history"] = [{"turn": 0, "response": {"action": "read"},
+                                          "feedback": payload["last_feedback"]}]
+        elif context_mode == "coding_test":
+            payload["last_feedback"] = {"status": "complete",
+                "baseline_results": copy.deepcopy(payload["results"]),
+                "results": copy.deepcopy(payload["results"])}
+    context = ResearchContext(payload, images, pinned_keys=("toolbox",), instruction=instruction)
+    context.persist(tmp_path / "dense_context")
+    prompt, _ = (context.coding_prompt(instruction) if interactive else context.prompt(instruction))
+    assert len(prompt) < 64_000
+    assert unpack(prompt)["toolbox"] == payload["toolbox"]
+    if interactive:
+        assert unpack(prompt)["read_history"] == payload["read_history"]
+    def outcomes(value):
+        if isinstance(value, dict):
+            if "status" in value and "success" in value:
+                return [value]
+            return [row for child in value.values() for row in outcomes(child)]
+        if isinstance(value, list):
+            return [row for child in value for row in outcomes(child)]
+        return []
+    rows, originals = outcomes(context.summary), outcomes(payload)
+    assert len(rows) == len(originals) and all(row["success"] is False for row in rows)
+    compacted = [row for row in rows if row.get("detail_overview")]
+    assert compacted
+    for row in compacted:
+        assert row["evidence"]["action_summary"]["min_tcp_height_m"] == .02
+        assert row["evidence"]["action_summary"]["close_commands"] == 1
+        details = json.loads(read_all_text(context, row["detail_overview"]["evidence_id"]))
+        assert details["evidence"]["action_summary"]["command_stage"] == "closed_then_lifted"
+        catalog_id = details["evidence"]["keyframes"]["evidence_id"]
+        catalog = json.loads(read_all_text(context, catalog_id))
+        assert len(catalog) == 12
+        assert all(entry["evidence_id"] in context.assets for entry in catalog)
+        original = json.loads(read_all_text(context, details["full_result"]["evidence_id"]))
+        assert original in originals
 
 
 def test_public_raw_evidence_remains_readable_with_summaries_and_cached_results(tmp_path):
@@ -482,3 +616,36 @@ def test_progress_and_termination_stay_visible_when_rollouts_are_compacted(tmp_p
     assert len(prompt) < MAX_PROMPT_CHARS
     assert len(attached) == MAX_IMAGES
     assert 'does not establish object contact' in prompt
+
+
+def test_closure_transition_survives_the_smallest_rollout_overview(tmp_path):
+    payload, images = large_evidence(tmp_path, count=2)
+    closure = {'action_index': 25, 'command_width_m': 0., 'command_force_n': 35.,
+               'endpoint_width_m': .04, 'next_arm_delay_s': .2,
+               'next_arm_start_width_m': .018,
+               'next_arm_endpoint': {'action_index': 28, 'width_m': .005,
+                                     'tcp_delta_m': [0., 0., .02]}}
+    for row in payload['results']:
+        row['evidence']['action_summary']['first_close_response'] = closure.copy()
+    ctx = ResearchContext(payload, images)
+    for row in ctx.summary['results']:
+        ctx._compact_rollout(row)
+    ctx.persist(tmp_path / 'closure_context')
+    for row in ctx.summary['results']:
+        compact = row['evidence']['action_summary']['first_close_response']
+        assert compact == {key: closure[key] for key in
+                           ('action_index', 'endpoint_width_m', 'next_arm_delay_s', 'next_arm_start_width_m')}
+        detail = json.loads(read_all_text(ctx, row['detail_overview']['evidence_id']))
+        assert detail['evidence']['action_summary']['first_close_response'] == closure
+    prompt, _ = ctx.prompt('Compare the public action sequence.')
+    assert len(prompt) < MAX_PROMPT_CHARS
+    assert 'Command return does not establish' in prompt
+
+
+def test_context_diagnostic_excerpts_skip_successful_recovery_records(tmp_path):
+    payload, images = large_evidence(tmp_path, count=1)
+    payload['results'][0]['evidence']['stdout'] += (
+        "\nMOTION {'success': True, 'results': [{'status': 'failed'}, {'status': 'accepted'}]}")
+    context = ResearchContext(payload, images)
+    stdout = context.summary['results'][0]['evidence']['stdout']
+    assert stdout['last_diagnostic_line'] == 'STOP tracking error'

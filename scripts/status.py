@@ -3,6 +3,7 @@
 import argparse
 from collections import Counter
 import json
+import os
 from pathlib import Path
 import time
 
@@ -14,6 +15,7 @@ progress = root / 'progress.jsonl'
 events = progress.read_text().splitlines() if progress.exists() else []
 calls = list((root / 'agent_calls').glob('*/request.json'))
 process = {'state': 'unknown', 'pid': None}
+process_started = None
 pid_file = root / 'research.pid'
 if pid_file.exists():
     try:
@@ -24,6 +26,16 @@ if pid_file.exists():
         process = {'state': 'running' if matches else 'stopped', 'pid': pid}
     except (OSError, ValueError, IndexError):
         process = {'state': 'stopped', 'pid': None}
+if process['state'] == 'running':
+    try:
+        # A resumed parent does not make abandoned requests from its predecessor
+        # active again. /proc start time is independent of the pid-file mtime.
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+        boot_time = next(float(line.split()[1]) for line in Path('/proc/stat').read_text().splitlines()
+                         if line.startswith('btime '))
+        process_started = boot_time + int(fields[19]) / os.sysconf('SC_CLK_TCK')
+    except (OSError, ValueError, IndexError, StopIteration):
+        pass
 active = []
 unfinished = []
 network_exempt = 0
@@ -36,7 +48,9 @@ for request in sorted(calls):
         item = {'call': request.parent.name, 'seconds': round(time.time()-data['started_at']),
                 'prompt_chars': data.get('prompt_chars', len(data.get('prompt', ''))),
                 'image_count': data.get('image_count', len(data.get('images', [])))}
-        (active if process['state'] == 'running' else unfinished).append(item)
+        current_process = (process['state'] == 'running'
+                           and (process_started is None or data['started_at'] >= process_started))
+        (active if current_process else unfinished).append(item)
 ledger = root / 'target_ledger.json'
 slots = list(json.loads(ledger.read_text())['slots'].values()) if ledger.exists() else []
 discovery_path = root / 'discovery.json'

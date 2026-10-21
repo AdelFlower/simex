@@ -4,7 +4,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation
 
 
-def score(task, metrics):
+def score(task, metrics, *, samples=None):
     objects = metrics['objects']
     tote = metrics['tote']
     center = np.array(tote['position'])
@@ -55,9 +55,17 @@ def score(task, metrics):
             return outside(name)
         if node['kind'] == 'lift':
             return obj['max_height'] - obj['initial_height'] >= node['min'] - 1e-6
+        if node['kind'] == 'sustained_lift':
+            from .temporal import sustained_lift
+            return sustained_lift(name, obj, metrics.get('sim_time'), samples,
+                                  node['min'], node['seconds'])
         if node['kind'] == 'displaced':
             initial = np.array(obj.get('initial_position', geometry[name]['position']))
             return np.linalg.norm(np.array(obj['position']) - initial) >= node['min']
+        if node['kind'] == 'released':
+            evidence = metrics.get('release_evidence', {}).get(name, {})
+            return (evidence.get('contract') == 'released_placement_v1'
+                    and evidence.get('released') is True)
         raise ValueError('Invalid predicate')
 
     return bool(evaluate(task['predicate']))

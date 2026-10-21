@@ -148,6 +148,120 @@ def test_complete_protocol_budgets_fixed_replay_and_independence(harness):
     assert (len(runner.calls), agent.count) == (calls, queries)
 
 
+def test_alignment_receives_library_actually_used_in_fixed_replay(harness):
+    runner, agent, run = harness
+    research.discover(runner, agent, run, SMALL)
+    ask = agent.ask
+    seen_libraries = []
+
+    def inspect_alignment(role, prompt, images=None):
+        payload = json.loads(prompt.split("INPUT JSON:\n", 1)[1])
+        if role == "align":
+            target = next(call for call in runner.calls
+                          if call["engine"] == "isaac" and call["script"] == payload["script"])
+            replay = runner.calls[-1]
+            assert replay["engine"] == "mujoco"
+            assert replay["script"] == target["script"]
+            # The current library may be a prior repair, not the Stage 1 baseline.
+            assert payload["toolbox"]["toolbox.py"] == target["toolbox"] == replay["toolbox"]
+            assert set(payload["toolbox"]) == {"toolbox.py", "skill.md"}
+            assert payload["toolbox"]["skill.md"]
+            assert "SHOULD_NEVER_REACH_AGENT" not in json.dumps(payload)
+            seen_libraries.append(payload["toolbox"]["toolbox.py"])
+        if role == "repair_select":
+            return {"selected": "candidate_00", "reason": "Exercise next-trial library provenance"}
+        return ask(role, prompt, images)
+
+    agent.ask = inspect_alignment
+    research.adapt(runner, agent, run, SMALL)
+    assert len(seen_libraries) == len(TASKS) * SMALL["adapt_trials"]
+    assert STAGE1_CODE in seen_libraries
+    assert any("REPAIR" in library for library in seen_libraries)
+
+
+def test_calibration_history_survives_resume_without_replaying_trials(harness):
+    runner, agent, run = harness
+    config = {**SMALL, "align_attempts": 2}
+    research.discover(runner, agent, run, config)
+    ask = agent.ask
+    stopped = False
+
+    def interrupt_second_assessment(role, prompt, images=None):
+        nonlocal stopped
+        payload = json.loads(prompt.split("INPUT JSON:\n", 1)[1])
+        if role == "align" and len(payload["alignment_history"]) == 2 and not stopped:
+            history = payload["alignment_history"]
+            assert history[0]["source_config"] == {}
+            assert history[1]["source_config"] == {"friction_scale": 1.2}
+            assert history[1]["proposal"]["reason"] == "Observed grip slip"
+            assert history[1]["source"]["status"] == "failed"
+            assert "SHOULD_NEVER_REACH_AGENT" not in json.dumps(history)
+            stopped = True
+            raise RuntimeError("test interruption before second calibration decision")
+        return ask(role, prompt, images)
+
+    agent.ask = interrupt_second_assessment
+    with pytest.raises(RuntimeError, match="test interruption"):
+        research.adapt(runner, agent, run, config)
+    completed_paths = [call["out"] for call in runner.calls]
+    result = research.adapt(runner, agent, run, config)
+    # Every recorded physics call, including those before interruption, ran once.
+    paths = [call["out"] for call in runner.calls]
+    assert len(paths) == len(set(paths))
+    assert all(paths.count(path) == 1 for path in completed_paths)
+    assert sum(call["engine"] == "isaac" for call in runner.calls) == 6
+    record = research._json(run / "adaptation/far/trial_00/alignment/history.json")
+    assert record["status"] == "update_limit_reached_unconfirmed"
+    assert record["updates_applied"] == 2
+    assert len(record["history"]) == 3
+    # The final replay has not been assessed by the align agent.
+    assert record["last_assessment"]["assessed_step"] == 1
+    assert record["last_assessment"]["response"]["aligned"] is False
+    assert "SHOULD_NEVER_REACH_AGENT" not in json.dumps(record)
+    for role in ("repair_hypotheses", "repair", "repair_select"):
+        payloads = [payload for name, payload, _ in agent.calls if name == role]
+        assert payloads
+        assert all(p["alignment"]["status"] == "update_limit_reached_unconfirmed" for p in payloads)
+        assert all(len(p["alignment"]["history"]) == 3 for p in payloads)
+    for task_id in TASKS:
+        summary = result["tasks"][task_id]["trials"][0]["alignment"]
+        assert summary["history"][0]["source_config"] == {}
+        assert summary["history"][1]["proposal"]["reason"] == "Observed grip slip"
+    later = [payload for role, payload, _ in agent.calls if role == "align" and payload["task_history"]]
+    assert later and all(p["task_history"][0]["alignment"]["updates_applied"] == 2 for p in later)
+
+
+@pytest.mark.parametrize("mode", ["confirmed", "no_budget", "no_script"])
+def test_calibration_confirmation_requires_assessment_of_current_replay(harness, mode):
+    runner, agent, run = harness
+    config = {**SMALL, "align_attempts": 0 if mode == "no_budget" else 2}
+    research.discover(runner, agent, run, config)
+    ask = agent.ask
+
+    def assess(role, prompt, images=None):
+        payload = json.loads(prompt.split("INPUT JSON:\n", 1)[1])
+        if role == "align" and len(payload["alignment_history"]) == 2:
+            return {"aligned": True, "source_config": {"mass_scale": 2.0}, "reason": "Observed behavior matches"}
+        return ask(role, prompt, images)
+
+    agent.ask = assess
+    if mode == "no_script":
+        runner.target_results = ["invalid_policy"] * 6
+    research.adapt(runner, agent, run, config)
+    record = research._json(run / "adaptation/far/trial_00/alignment/history.json")
+    if mode == "confirmed":
+        assert record["status"] == "agent_confirmed_aligned"
+        assert record["updates_applied"] == 1
+        assert len(record["history"]) == 2
+        assert record["last_assessment"]["assessed_step"] == 1
+        assert record["history"][-1]["source_config"] == {"friction_scale": 1.2}
+    else:
+        assert record["updates_applied"] == 0
+        assert record["last_assessment"] is None
+        assert record["status"] == ("fixed_policy_unavailable" if mode == "no_script" else "update_limit_reached_unconfirmed")
+        assert len(record["history"]) == (0 if mode == "no_script" else 1)
+
+
 @pytest.mark.parametrize("failure", ["timeout", "invalid_policy", "generation_error", "interrupted"])
 def test_target_failure_consumes_slot_but_pre_execution_infrastructure_can_resume(harness, failure):
     runner, agent, run = harness
@@ -491,11 +605,116 @@ def test_prepared_policy_can_execute_when_last_model_call_used_budget(harness):
 
 @pytest.mark.parametrize("value", [
     {"friction_scale": -1}, {"camera_offset": [0, 0, 1]},
+    {"friction_scale": .029999}, {"friction_scale": 2.01},
     {"tcp_offset": [0, 0, 0]}, {"mass_scale": float("nan")},
 ])
 def test_source_calibration_rejects_unbounded_or_unsupported_parameters(value):
     with pytest.raises(research.ResearchError):
         research._calibration(value)
+
+
+def test_low_friction_calibration_reaches_source_screening_only(harness):
+    runner, agent, run = harness
+    research.discover(runner, agent, run, SMALL)
+    ask = agent.ask
+
+    def low_friction(role, prompt, images=None):
+        if role == "align":
+            assert "friction_scale [0.03,2]" in prompt
+            return {"aligned": False, "source_config": {"friction_scale": .1},
+                    "reason": "Test contact-slip hypothesis from public replay evidence"}
+        return ask(role, prompt, images)
+
+    agent.ask = low_friction
+    offset = len(runner.calls)
+    research.adapt(runner, agent, run, SMALL)
+    calls = runner.calls[offset:]
+    screening = [call for call in calls if "screen" in call["out"].parts]
+    assert screening and all(call["source_config"]["friction_scale"] == .1 for call in screening)
+    proposals = [payload for role, payload, _ in agent.calls if role == "screen_tasks"]
+    assert proposals and all(payload["source_config"] == {"friction_scale": .1}
+                             for payload in proposals)
+    target = [call for call in calls if call["engine"] == "isaac"]
+    assert target and all(not call.get("source_config") for call in target)
+
+
+def test_actuator_calibration_profile_is_frozen_and_source_only(harness):
+    runner, agent, run = harness
+    config = {**SMALL, "source_calibration_profile": "actuator_v1"}
+    research.discover(runner, agent, run, config)
+    with pytest.raises(research.ResearchError, match="calibration profile changed"):
+        research._initialize(run, SMALL)
+    ask = agent.ask
+    parameters = {"arm_settle_s": .15, "gripper_stiffness_scale": .5,
+                  "gripper_damping_scale": 2.}
+
+    def calibrate(role, prompt, images=None):
+        if role == "align":
+            assert "arm_settle_s [0,0.5]" in prompt
+            assert "per-finger force cap" in prompt
+            return {"aligned": False, "source_config": parameters,
+                    "reason": "Test distinct arm timing and finger response hypotheses"}
+        return ask(role, prompt, images)
+
+    agent.ask = calibrate
+    offset = len(runner.calls)
+    research.adapt(runner, agent, run, config)
+    calls = runner.calls[offset:]
+    screening = [call for call in calls if "screen" in call["out"].parts]
+    assert screening and all(call['source_config'] == parameters for call in screening)
+    target = [call for call in calls if call['engine'] == 'isaac']
+    assert target and all(not call.get('source_config') for call in target)
+    offset = len(runner.calls)
+    research.evaluate(runner, agent, run, config)
+    assert runner.calls[offset:]
+    assert all(not call.get('source_config') for call in runner.calls[offset:])
+
+
+def test_basic_calibration_run_cannot_enable_actuator_profile_on_resume(harness):
+    _, _, run = harness
+    research._initialize(run, SMALL)
+    with pytest.raises(research.ResearchError, match="calibration profile changed"):
+        research._initialize(run, {**SMALL, 'source_calibration_profile': 'actuator_v1'})
+
+
+@pytest.mark.parametrize('mode', ['legacy', 'interactive'])
+def test_discovery_knows_complete_release_contract_without_replacing_subtask_predicates(harness, monkeypatch, mode):
+    from simex.tasks import TASK_IDS, make_task, source_task_from_spec
+    runner, agent, run = harness
+    monkeypatch.setattr(research, 'TASK_IDS', TASK_IDS)
+    monkeypatch.setattr(research, 'make_task', make_task)
+    monkeypatch.setattr(research, 'source_task_from_spec', lambda spec: source_task_from_spec(
+        {**spec, 'base_task_id': {'far': 'far_plate', 'near': 'far_to_near', 'offset': 'shifted_single'}.get(
+            spec.get('base_task_id'), spec.get('base_task_id', 'far_plate'))}))
+    ask = agent.ask
+
+    def finish_coding(role, prompt, images=None):
+        if role == 'discover_code':
+            agent.count += 1
+            payload = json.loads(prompt.split('INPUT JSON:\n', 1)[1])
+            agent.calls.append((role, payload, images))
+            return {'action': 'finish', 'reason': 'Contract propagation test only'}
+        return ask(role, prompt, images)
+
+    agent.ask = finish_coding
+    config = {**SMALL, 'placement_contract': 'released_placement_v1', 'discovery_mode': mode}
+    research.discover(runner, agent, run, config)
+    expected_roles = {'discover_probe', 'discover_focus',
+                      'discover_code' if mode == 'interactive' else 'discover_revision'}
+    for role in expected_roles:
+        requests = [payload for kind, payload, _ in agent.calls if kind == role]
+        assert requests
+        for payload in requests:
+            reference = payload['complete_placement_reference']
+            assert reference['contract'] == 'released_placement_v1'
+            assert {'kind': 'released', 'object': 'green'} in reference['predicate']['all']
+            assert 'not a fixed curriculum' in reference['scope']
+            assert 'at least 5 cm' in reference['description']
+    probes = [call for call in runner.calls if call['out'].parent.name == 'probes']
+    assert probes
+    assert all(call['task']['predicate'] == {'all': [{'kind': 'lift', 'object': 'green', 'min': .05}]}
+               for call in probes)
+    assert all(call['engine'] == 'mujoco' for call in runner.calls)
 
 
 @pytest.mark.parametrize('full_success,auxiliary_success,expected', [
@@ -519,6 +738,13 @@ def test_selection_ranks_full_then_common_auxiliary_and_never_fast_failure(
     assert result['winner'] == expected
     assert result['process_complete']
     assert result['full_task_verified'] is (full_success is not None)
+    report = research.report(run)
+    assert report['stage1']['full_task_predicate_verified'] is (full_success is not None)
+    assert report['stage1']['full_task_verification_scope'] == 'frozen_task_predicates'
+    assert report['stage1']['released_placement_verified'] is None
+    text = (run / 'report.md').read_text()
+    assert '得分不等同于完成释放放置' in text
+    assert '已出现独立完整入箱成功' not in text
     common = research._json(run / 'auxiliary_selection_tasks.json')
     assert [(t['predicate']['all'][0]['kind'], t['predicate']['all'][0]['min']) for t in common] == [
         ('lift', .05), ('lift', .05), ('displaced', .03), ('displaced', .03)]
@@ -540,6 +766,21 @@ def test_completed_discovery_does_not_verify_auxiliary_schedule_hash(harness):
     count = len(runner.calls), agent.count
     assert research.discover(runner, agent, run, SMALL)["process_complete"]
     assert (len(runner.calls), agent.count) == count
+
+
+def test_frozen_peer_ideas_survive_focus_and_legacy_revision_without_later_round_access(harness):
+    runner, agent, run = harness
+    research.discover(runner, agent, run, {**SMALL, "cycles": 2})
+    expected = [research._json(run / f"discovery/member_{member:02d}/cycle_{cycle:02d}/peer_summaries.json")
+                for cycle in range(2) for member in range(2)]
+    assert expected[:2] == [[], []]
+    for member, summaries in enumerate(expected[2:]):
+        assert summaries[0]["member"] == 1 - member
+        assert [s["cycle"] for s in summaries[0]["summaries"]] == [0]
+        assert "toolbox.py" not in json.dumps(summaries)
+    for role in ("discover_probe", "discover_focus", "discover_revision"):
+        seen = [payload["peer_experiment_summaries"] for name, payload, _ in agent.calls if name == role]
+        assert seen == expected
 
 
 def test_stage1_report_shows_all_nine_trials_and_keeps_stage1_call_count(harness):

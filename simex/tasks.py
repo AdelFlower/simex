@@ -6,6 +6,15 @@ import re
 import numpy as np
 
 TASK_IDS = ['far_plate', 'far_to_near', 'shifted_single']
+PLACEMENT_CONTRACTS = ('legacy_geometry', 'released_placement_v1')
+# Source calibration only: task generators retain their nominal material bounds.
+FRICTION_SCALE_BOUNDS = (.03, 2.)
+# Optional source-only controller model; nominal tasks cannot set these fields.
+ACTUATOR_CALIBRATION_BOUNDS = {
+    'arm_settle_s': (0., .5),
+    'gripper_stiffness_scale': (.25, 1.),
+    'gripper_damping_scale': (1., 4.),
+}
 JOINT_LIMITS = np.array([
     [-2.8973, 2.8973], [-1.7628, 1.7628], [-2.8973, 2.8973],
     [-3.0718, -.0698], [-2.8973, 2.8973], [-.0175, 3.7525],
@@ -18,7 +27,7 @@ DESCRIPTIONS = {
 }
 
 
-def make_task(task_id, seed):
+def make_task(task_id, seed, placement_contract='legacy_geometry'):
     if task_id not in TASK_IDS:
         raise ValueError(f'Unknown task: {task_id}')
     rng = np.random.default_rng(int(seed))
@@ -42,10 +51,31 @@ def make_task(task_id, seed):
                  plates=[plate, distractor],
                  tote=dict(position=tote, inner_size=[.26, .22, .10], wall_thickness=.008, yaw=yaw),
                  targets=['green'], physics=dict(dt=1 / 240), cameras=dict(width=320, height=240))
-    return dict(name=task_id, description=DESCRIPTIONS[task_id], scene=scene,
+    task = dict(name=task_id, description=DESCRIPTIONS[task_id], scene=scene,
                 predicate={'all': [{'kind': 'lift', 'object': 'green', 'min': .05},
                                    {'kind': 'inside', 'object': 'green'},
                                    {'kind': 'outside', 'object': 'red'}]})
+    return with_placement_contract(task, placement_contract)
+
+
+def with_placement_contract(task, contract):
+    if contract not in PLACEMENT_CONTRACTS:
+        raise ValueError(f'Unsupported placement contract: {contract}')
+    result = copy.deepcopy(task)
+    if contract == 'released_placement_v1':
+        def includes_release(node):
+            return (node.get('kind') == 'released' and node.get('object') == 'green') or any(
+                includes_release(child) for key in ('all', 'any') for child in node.get(key, []))
+        if not includes_release(result['predicate']):
+            predicate = result['predicate']
+            children = predicate['all'] if set(predicate) == {'all'} else [predicate]
+            result['predicate'] = {'all': children + [{'kind': 'released', 'object': 'green'}]}
+            result['description'] += (
+                ' Release the plate by opening the fingers to at least 6 cm, then withdraw the hand '
+                'at least 5 cm from its position at the end of opening. The final TCP must be at least '
+                'one plate radius plus 5 cm from the plate center. Leave the plate stationary inside '
+                'the tote, separated from the hand, for at least the final 0.5 seconds.')
+    return result
 
 
 def _merge(dst, src):
@@ -100,7 +130,8 @@ def validate_scene(scene, *, calibrated=False):
         ('robot', {'base_position', 'home'}), ('table', {'center', 'size'}),
         ('tote', {'position', 'inner_size', 'wall_thickness', 'yaw'}),
         ('cameras', {'width', 'height', 'offset'}),
-        ('physics', {'dt', 'contact_friction_scale'}),
+        ('physics', {'dt', 'contact_friction_scale'} |
+         (set(ACTUATOR_CALIBRATION_BOUNDS) if calibrated else set())),
     ):
         if key in scene:
             _fields(scene[key], allowed, key)
@@ -124,9 +155,12 @@ def validate_scene(scene, *, calibrated=False):
         raise ValueError('Camera resolution must be at most 786432 pixels and aspect ratio 1/4..4')
     cameras['offset'] = _vector(cameras.get('offset', [0, 0, 0]), [-.05] * 3, [.05] * 3, 'cameras.offset')
     physics['dt'] = _number(physics['dt'], 1 / 1000, 1 / 60, 'physics.dt')
-    physics['contact_friction_scale'] = _number(physics.get('contact_friction_scale', 1), .3, 2, 'physics.contact_friction_scale')
+    physics['contact_friction_scale'] = _number(physics.get('contact_friction_scale', 1), *FRICTION_SCALE_BOUNDS, 'physics.contact_friction_scale')
     if not calibrated and physics['contact_friction_scale'] != 1:
         raise ValueError('Contact friction scale is reserved for source calibration')
+    for key, bounds in ACTUATOR_CALIBRATION_BOUNDS.items():
+        if key in physics:
+            physics[key] = _number(physics[key], *bounds, f'physics.{key}')
 
     plates = result['plates']
     if not isinstance(plates, list) or not 1 <= len(plates) <= 5:
@@ -166,11 +200,16 @@ def validate_predicate(node, names, depth=0):
         for child in children:
             validate_predicate(child, names, depth + 1)
         return
-    if node.get('kind') not in ('lift', 'inside', 'outside', 'displaced') or node.get('object') not in names:
+    if node.get('kind') not in ('lift', 'sustained_lift', 'inside', 'outside', 'displaced', 'released') or node.get('object') not in names:
         raise ValueError('Unsupported predicate or object')
-    if node['kind'] in ('lift', 'displaced'):
+    if node['kind'] in ('lift', 'sustained_lift', 'displaced'):
         _number(node.get('min', 0), .001, 1, 'Predicate displacement')
-    if set(node) - {'kind', 'object', 'min'}:
+    if node['kind'] == 'sustained_lift':
+        _number(node.get('seconds', 0), .5, 5, 'Sustained lift window')
+    if node['kind'] == 'released' and set(node) != {'kind', 'object'}:
+        raise ValueError('Release thresholds belong to the versioned contract')
+    allowed = {'kind', 'object', 'min'} | ({'seconds'} if node['kind'] == 'sustained_lift' else set())
+    if set(node) - allowed:
         raise ValueError('Unexpected predicate fields')
 
 
@@ -196,9 +235,9 @@ def source_task_from_spec(spec):
 
 def calibrated_scene(scene, calibration):
     scene = validate_scene(scene)
-    allowed = {'mass_scale', 'friction_scale', 'camera_offset', 'controller_duration_scale'}
+    allowed = {'mass_scale', 'friction_scale', 'camera_offset', 'controller_duration_scale'} | set(ACTUATOR_CALIBRATION_BOUNDS)
     _fields(calibration, allowed, 'calibration')
-    for key, lo, hi in [('mass_scale', .5, 2), ('friction_scale', .3, 2), ('controller_duration_scale', .5, 2)]:
+    for key, lo, hi in [('mass_scale', .5, 2), ('friction_scale', *FRICTION_SCALE_BOUNDS), ('controller_duration_scale', .5, 2)]:
         _number(calibration.get(key, 1), lo, hi, key)
     # A supplied calibration is an absolute source-camera correction; absence
     # preserves the scene's configured offset rather than silently erasing it.
@@ -209,5 +248,8 @@ def calibrated_scene(scene, calibration):
     # Apply after MuJoCo compilation to ALL geom sliding coefficients, including
     # table and fingertip defaults. Scaling only a plate is masked by max mixing.
     scene['physics']['contact_friction_scale'] = float(calibration.get('friction_scale', 1))
+    for key, bounds in ACTUATOR_CALIBRATION_BOUNDS.items():
+        if key in calibration:
+            scene['physics'][key] = _number(calibration[key], *bounds, key)
     scene['cameras']['offset'] = list(offset)
     return validate_scene(scene, calibrated=True)

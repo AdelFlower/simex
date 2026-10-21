@@ -1,0 +1,37 @@
+# Independent follow-up study; do not resume reproduction_release_20261021.
+# Start from the primitive library, without importing any learned toolbox,
+# target policy, target state, or prior target feedback into Stage 1.
+# Task generation receives complete placement semantics and may choose the
+# sustained_lift predicate for elevated-endpoint sub-goals; no fixed curriculum.
+# Finish the existing study's frozen evaluation before launching this study.
+placement_contract: released_placement_v1
+source_calibration_profile: actuator_v1
+population: 2
+cycles: 6
+probes: 8
+focused: 4
+revisions: 2
+discovery_mode: interactive
+coding_max_turns: 40
+coding_max_tests: 10
+replay: 2
+adapt_trials: 5
+repairs: 2
+screen_tasks: 3
+align_attempts: 3
+eval_trials: 5
+selection_trials: 3
+seed: 20261022
+agent_timeout: 600
+policy_timeout: 240
+max_sim_time: 120
+model: gpt-6-astra
+reasoning_effort: high
+stage1_reasoning_effort: high
+stage2_reasoning_effort: high
+evaluation_reasoning_effort: medium
+stage1_agent_timeout: 900
+# Separate study budget, not an extension or refund of the original 2000 calls.
+max_agent_calls: 2000
+source_policy_workers: 3
+isaac_asset: /home/kemove/DexGarmentLab/Assets/Robots/franka/franka.usd

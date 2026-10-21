@@ -20,7 +20,7 @@ def backend():
     instance.close()
 
 
-@pytest.mark.parametrize('scale', [.3, .5, 1., 2.])
+@pytest.mark.parametrize('scale', [.03, .1, .3, .5, 1., 2.])
 def test_calibration_scales_actual_table_and_fingertip_contacts(backend, scale):
     backend.reset(calibrated_scene(make_task('far_plate', 0)['scene'], {'friction_scale': scale}))
     model, data = backend.model, backend.data
@@ -132,6 +132,7 @@ def test_task_schema_rejects_invalid_types_and_values(spec):
 
 
 @pytest.mark.parametrize('config', [{'mass_scale': float('nan')}, {'friction_scale': 0},
+                                    {'friction_scale': .029999}, {'friction_scale': 2.01},
                                     {'mass_scale': '1.0'}, {'camera_offset': [0, 0]},
                                     {'camera_offset': [0, 0, float('inf')]},
                                     {'controller_duration_scale': True}, {'unknown': 1}])

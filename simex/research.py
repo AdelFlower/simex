@@ -26,7 +26,8 @@ from .contracts import CAPABILITY_GUIDANCE
 from .errors import ResearchError
 from .research_context import (ContextError, MAX_PROMPT_CHARS, MAX_READ_ROUNDS,
                                READ_CHARS, ResearchContext, apply_source_edits, prepare_edit_context)
-from .tasks import TASK_IDS, make_task, source_task_from_spec
+from .tasks import (TASK_IDS, PLACEMENT_CONTRACTS, FRICTION_SCALE_BOUNDS, ACTUATOR_CALIBRATION_BOUNDS,
+                    make_task, source_task_from_spec, with_placement_contract)
 
 
 DEFAULTS = {
@@ -64,8 +65,22 @@ TASK_SPEC_HELP = (
     "abs(y)<=0.45, z [0,0.25], radius [0.03,0.12], mass [0.02,1], friction [0.1,2]. "
     "A predicate is "
     '{"all":[{"kind":"lift","object":"green","min":0.05},'
-    '{"kind":"inside","object":"green"}]}; kinds lift,inside,outside,'
-    "displaced (min meters). Design relevant, nontrivial predicates; never "
+    '{"kind":"inside","object":"green"}]}; kinds lift,sustained_lift,inside,outside,'
+    "displaced (min meters), and released (fixed versioned opening, withdrawal, "
+    "separation and settled-containment checks; no min field). Preserve any supplied "
+    "released predicate exactly. inside checks geometric containment and can pass "
+    "while an object is still held; it does not establish release. Include released "
+    "when a task claims complete released placement. Subtasks may use their own "
+    "partial predicates, but their descriptions must state that limited objective. "
+    "A subtask success is evidence only for its declared predicate. "
+    "lift tests historical maximum height, so a transient excursion can pass. "
+    'For sampled elevation throughout the final interval use {"kind":"sustained_lift",'
+    '"object":"green","min":0.05,"seconds":1.0}; seconds is [0.5,5]. '
+    "This requires elevated final state and complete sampled window coverage with "
+    "no gap above 0.30 s; it does not certify grasp attachment. Allow time to observe "
+    "the full interval and state this objective in the task description. Use it for "
+    "an elevated endpoint subtask, not a task meant to finish with the object placed down. "
+    "Design relevant, nontrivial predicates; never "
     "weaken a predicate after seeing an outcome. Task descriptions must tell "
     "the policy what to achieve without object truth poses. If overriding plates, "
     "supply complete plate objects, including names and all geometry/appearance "
@@ -216,6 +231,14 @@ def _lock(run_dir: Path):
 
 def _initialize(run_dir: Path, config: dict) -> dict:
     cfg = {**DEFAULTS, **config}
+    calibration_profile = cfg.get("source_calibration_profile", "basic")
+    if calibration_profile not in ("basic", "actuator_v1"):
+        raise ResearchError("source_calibration_profile must be basic or actuator_v1")
+    contract = cfg.setdefault("placement_contract", "legacy_geometry")
+    if contract not in PLACEMENT_CONTRACTS:
+        raise ResearchError("Unsupported placement contract")
+    if cfg.get("stage1_parent"):
+        cfg["stage1_parent"] = str(Path(cfg["stage1_parent"]).resolve())
     mode = cfg.setdefault("discovery_mode", "legacy")
     if mode not in ("legacy", "interactive"):
         raise ResearchError("discovery_mode must be legacy or interactive")
@@ -239,6 +262,16 @@ def _initialize(run_dir: Path, config: dict) -> dict:
             raise ResearchError("Stage 1 protocol changed; create a new run to preserve experiment provenance")
         _check_selection_sets(run_dir, manifest)
         old = manifest["config"]
+        if old.get("source_calibration_profile", "basic") != calibration_profile:
+            raise ResearchError("Source calibration profile changed; create a new run")
+        if old.get("placement_contract", "legacy_geometry") != contract:
+            raise ResearchError("Placement contract changed; create a new run")
+        if contract == "released_placement_v1":
+            from .release import CONTRACT_SPEC
+            if manifest.get("placement_contract_spec") != CONTRACT_SPEC:
+                raise ResearchError("Release thresholds changed; create a new run")
+        if old.get("stage1_parent") != cfg.get("stage1_parent"):
+            raise ResearchError("Stage 1 provenance changed; create a new run")
         if old.get("discovery_mode", "legacy") != mode:
             raise ResearchError("Discovery mode changed; create a new run")
         if mode == "interactive" and any(old.get(key) != cfg[key] for key in
@@ -256,9 +289,10 @@ def _initialize(run_dir: Path, config: dict) -> dict:
         if not isinstance(ledger, dict) or not isinstance(ledger.get("slots"), dict):
             raise ResearchError("Target ledger is missing or invalid")
         return manifest["config"]
-    initial = Path(__file__).parent / "initial"
+    initial = (Path(cfg["stage1_parent"]) / "frozen" / "initial"
+               if cfg.get("stage1_parent") else Path(__file__).parent / "initial")
     _freeze(initial, run_dir / "frozen" / "initial")
-    selection = [make_task(task_id, cfg["seed"] + 10000 + i * 100 + j)
+    selection = [with_placement_contract(make_task(task_id, cfg["seed"] + 10000 + i * 100 + j), contract)
                  for i, task_id in enumerate(TASK_IDS)
                  for j in range(cfg["selection_trials"])]
     _save(run_dir / "selection_tasks.json", selection)
@@ -279,7 +313,9 @@ def _initialize(run_dir: Path, config: dict) -> dict:
                               "seed": cfg["seed"] + 30000 + i * 1000 + trial,
                               "state": "pending"}
     _save(run_dir / "target_ledger.json", {"slots": slots})
+    from .release import CONTRACT_SPEC
     _save(manifest_path, {"format_version": 3, "config": cfg, "provenance": _provenance(cfg),
+                          "placement_contract_spec": CONTRACT_SPEC if contract == "released_placement_v1" else None,
                           "selection_sha256": _digest(selection),
                           "auxiliary_selection_sha256": _digest(auxiliary),
                           "target_schedule_sha256": _digest({k: {a: b for a, b in v.items()
@@ -312,9 +348,21 @@ def _check_selection_sets(run_dir: Path, manifest: dict):
             raise ResearchError(f"Source selection tasks are missing or invalid: {filename}")
 
 
-def _scene_context() -> dict:
+def _scene_context(cfg: dict | None = None) -> dict:
     templates = {task_id: make_task(task_id, 0)["scene"] for task_id in TASK_IDS}
-    return {"source_scene_template": templates[TASK_IDS[0]], "source_scene_templates": templates}
+    context = {"source_scene_template": templates[TASK_IDS[0]], "source_scene_templates": templates}
+    if (cfg or {}).get("placement_contract") == "released_placement_v1":
+        reference = with_placement_contract(make_task(TASK_IDS[0], 0), "released_placement_v1")
+        context["complete_placement_reference"] = {
+            "contract": "released_placement_v1", "description": reference["description"],
+            "predicate": reference["predicate"],
+            "scope": "Reference for the meaning of complete released placement, not a fixed "
+                     "curriculum. Choose broad tasks, variations, sub-goals and predicates from "
+                     "source evidence. Prerequisite or held-object tasks need not satisfy the "
+                     "complete objective; label their scope explicitly and do not count their "
+                     "success as full placement. Keep each task's predicate frozen during optimization.",
+        }
+    return context
 
 
 def _record_scene_variations(response: dict, tasks: list[dict], path: Path):
@@ -493,6 +541,15 @@ def _public(result: dict) -> dict:
     # can name hidden target assets, files or implementation details.
     if result.get("status") in ("interrupted", "infrastructure_error"):
         evidence = {**evidence, "reason": "Execution interrupted by infrastructure failure.", "stdout": ""}
+    elif result.get("output_dir"):
+        # Older results embedded only the final 16k characters, sometimes starting
+        # in the middle of a long motion record. The policy's own captured stdout
+        # is public evidence. Read only this fixed artifact, never model-supplied
+        # paths or other files in the rollout directory.
+        root = Path(result["output_dir"]).resolve()
+        transcript = (root / "policy_stdout.log").resolve()
+        if transcript == root / "policy_stdout.log" and transcript.is_file():
+            evidence = {**evidence, "stdout": transcript.read_text()}
     if evidence.get("recording_errors"):
         evidence = {**evidence, "recording_errors": ["Public evidence capture failed."] * len(evidence["recording_errors"])}
     from .evidence import summarize_public_evidence
@@ -635,7 +692,10 @@ def _target(runner, run_dir: Path, slot_key: str, toolbox: Path, out: Path) -> d
                     toolbox_sha256=toolbox_hash(toolbox))
         _save(ledger_path, ledger)
         try:
-            result = _run(runner, "isaac", make_task(slot["task_id"], slot["seed"]),
+            cfg = _json(run_dir / "manifest.json", {}).get("config", {})
+            task = with_placement_contract(make_task(slot["task_id"], slot["seed"]),
+                                           cfg.get("placement_contract", "legacy_geometry"))
+            result = _run(runner, "isaac", task,
                           toolbox, out)
         except BaseException:
             existing = _json(result_path)
@@ -916,7 +976,7 @@ def _discover_cycle(runner, agent, run_dir: Path, cfg: dict, index: int, cycle: 
         "object-motion predicates, not mostly complete delivery tasks. Choose the "
         "tasks yourself; no fixed curriculum is prescribed. " + TASK_SPEC_HELP,
         {"member": index, "cycle": cycle, "toolbox": _contents(current),
-         **_scene_context(),
+         **_scene_context(cfg),
          "own_history": summaries, "recent_research_history": histories[-2:],
          "peer_experiment_summaries": peers})
     probes = _tasks_from_response(probe_response, cfg["probes"])
@@ -940,9 +1000,12 @@ def _discover_cycle(runner, agent, run_dir: Path, cfg: dict, index: int, cycle: 
         "observations, never proof of grasp success; compare the independent predicate. "
         "Diagnose unnecessary precondition vetoes and observation recovery before "
         "attributing such outcomes to friction, payload or grasp mechanics. "
-        "Successful one-shot scripts are diagnostic evidence, not persistent capabilities. " + TASK_SPEC_HELP,
-        {"toolbox": _contents(current), **_scene_context(), "probe_tasks": probes, "probe_results": probe_evidence,
+        "Successful one-shot scripts are diagnostic evidence, not persistent capabilities. "
+        "Treat frozen peer summaries as hypotheses to check independently, not this member's "
+        "demonstrated capabilities. " + TASK_SPEC_HELP,
+        {"toolbox": _contents(current), **_scene_context(cfg), "probe_tasks": probes, "probe_results": probe_evidence,
          "probe_scene_variations": probe_variations,
+         "peer_experiment_summaries": peers,
          "recent_research_history": histories[-2:]})
     focused = _tasks_from_response(focus, cfg["focused"])
     _record_scene_variations(focus, focused, cycle_dir / "focused_scene_variations.json")
@@ -967,12 +1030,13 @@ def _discover_cycle(runner, agent, run_dir: Path, cfg: dict, index: int, cycle: 
         current, current_results, bank, accepted, revision_history, coding_summary = run_coding_cycle(
             runner, agent, cycle_dir / "coding", cfg, current=current, current_results=current_results,
             bank=bank, tasks=focused + replay, focused=len(focused), replay=replay_records, cycle=cycle,
-            payload={"weakness": focus.get("weakness"), **_scene_context(),
+            payload={"weakness": focus.get("weakness"), **_scene_context(cfg),
                      "tasks": focused + replay,
                      "probe_examples": [{"task": task, "result": result}
                                         for task, result in zip(probes, probe_evidence)],
                      "probe_toolbox": _contents(probe_toolbox),
                      "historical_replay_anchors": anchors,
+                     "peer_experiment_summaries": peers,
                      "recent_research_history": histories[-2:]})
     for revision in range(0 if interactive else cfg["revisions"]):
         rev_dir = cycle_dir / f"revision_{revision:02d}"
@@ -993,13 +1057,14 @@ def _discover_cycle(runner, agent, run_dir: Path, cfg: dict, index: int, cycle: 
             "described in the exploration contract. Use action_summary and phase images "
             "to identify whether closing, lifting or releasing was actually exercised; "
             "robot motion alone does not demonstrate object acquisition.",
-            {"weakness": focus.get("weakness"), "toolbox": _contents(current), **_scene_context(),
+            {"weakness": focus.get("weakness"), "toolbox": _contents(current), **_scene_context(cfg),
              "tasks": focused + replay, "results": [_source_evidence(r) for r in current_results],
              "probe_examples": [{"task": task, "result": result}
                                 for task, result in zip(probes, probe_evidence)],
              "probe_toolbox": _contents(probe_toolbox),
              "probe_toolbox_sha256": toolbox_hash(probe_toolbox),
              "historical_replay_anchors": anchors, "prior_attempts": revision_history,
+             "peer_experiment_summaries": peers,
              "recent_research_history": histories[-2:]})
         candidate, validation = _candidate(proposal, rev_dir)
         attempt_record = {"revision": revision, "hypothesis": proposal.get("hypothesis"),
@@ -1103,6 +1168,9 @@ def discover(runner, agent, run_dir: Path, config: dict) -> dict:
         if done:
             _check_frozen(run_dir / "frozen" / "stage1")
             return done
+        if cfg.get("stage1_parent"):
+            from .continuation import inherit_stage1
+            return inherit_stage1(run_dir, cfg)
         _progress(run_dir, "discovery_started", population=cfg["population"], cycles=cfg["cycles"])
         states = [{"current": _snapshot(run_dir / "frozen" / "initial",
                                         run_dir / "discovery" / f"member_{index:02d}" / "initial"),
@@ -1177,11 +1245,15 @@ def _selection_record(task: dict, result: dict, trial: int) -> dict:
             "phase_images": evidence.get("phase_images", []), "reason": evidence.get("reason")}
 
 
-def _calibration(value: dict) -> dict:
+def _calibration(value: dict, profile: str = "basic") -> dict:
     if not isinstance(value, dict):
         raise ResearchError("source_config must be an object")
-    bounds = {"mass_scale": (0.5, 2.0), "friction_scale": (0.3, 2.0),
+    bounds = {"mass_scale": (0.5, 2.0), "friction_scale": FRICTION_SCALE_BOUNDS,
               "controller_duration_scale": (0.5, 2.0)}
+    if profile == "actuator_v1":
+        bounds.update(ACTUATOR_CALIBRATION_BOUNDS)
+    elif profile != "basic":
+        raise ResearchError("Unsupported source calibration profile")
     if set(value) - (set(bounds) | {"camera_offset"}):
         raise ResearchError("Unsupported source calibration parameter")
     for key, (lo, hi) in bounds.items():
@@ -1196,6 +1268,25 @@ def _calibration(value: dict) -> dict:
         ):
             raise ResearchError("camera_offset must have three components within +/-0.05 m")
     return copy.deepcopy(value)
+
+
+def _actuator_calibration_help(cfg: dict) -> str:
+    if cfg.get("source_calibration_profile", "basic") != "actuator_v1":
+        return ""
+    return (
+        "The actuator_v1 profile also permits source-only arm_settle_s [0,0.5]: "
+        "append this many seconds holding the final arm target after each successful-IK "
+        "move, before reporting its state; do not stretch the arm trajectory. "
+        "gripper_stiffness_scale [0.25,1] and gripper_damping_scale [1,4] multiply "
+        "the source finger position-servo stiffness and velocity damping independently "
+        "(defaults 1); they preserve the requested width, linear target ramp, command "
+        "duration and per-finger force cap. "
+        "These parameters do not alter the arm gains, cameras, objects, target engine "
+        "or policy API. arm_settle_s defaults to 0 and does not apply to gripper or wait. "
+        "Use the public command-response evidence to justify a change and inspect its "
+        "fixed-policy replay; an aperture or timing match alone does not establish "
+        "contact equivalence or task-relevant alignment. "
+    )
 
 
 def _executed_script(result: dict) -> str | None:
@@ -1214,6 +1305,14 @@ def _executed_script(result: dict) -> str | None:
 def _source_reconstruction(task_id: str, public_evidence: dict) -> dict:
     from .perception import source_task_from_observation
     return source_task_from_observation(task_id, public_evidence)
+
+
+def _alignment_summary(alignment: dict) -> dict:
+    """Carry calibration decisions and public outcomes across task iterations."""
+    return {**{key: copy.deepcopy(value) for key, value in alignment.items() if key != "history"},
+            "history": [{**{key: copy.deepcopy(value) for key, value in entry.items() if key != "source"},
+                         "source": _outcome_summary(entry["source"])}
+                        for entry in alignment["history"]]}
 
 
 def adapt(runner, agent, run_dir: Path, config: dict) -> dict:
@@ -1249,45 +1348,92 @@ def adapt(runner, agent, run_dir: Path, config: dict) -> dict:
                 nominal_task = _json(reconstruction_path)
                 if nominal_task is None:
                     nominal_task = _source_reconstruction(task_id, _public(target)["evidence"])
+                    nominal_task = with_placement_contract(
+                        nominal_task, cfg.get("placement_contract", "legacy_geometry"))
                     _save(reconstruction_path, nominal_task)
                 source = None
+                alignment = {"context_version": 1, "status": "fixed_policy_unavailable",
+                             "updates_applied": 0, "max_updates": cfg["align_attempts"],
+                             "last_assessment": None, "history": []}
                 if fixed_script is not None:
                     source = _run(runner, "mujoco", nominal_task, current,
                                   trial_dir / "alignment" / "initial", fixed_script, source_config)
+                    alignment["status"] = "update_limit_reached_unconfirmed"
+                    alignment["history"].append({"step": 0,
+                        "source_config": copy.deepcopy(source_config), "proposal": None,
+                        "source": _public(source)})
                     for attempt in range(cfg["align_attempts"]):
                         align_dir = trial_dir / "alignment" / f"attempt_{attempt:02d}"
                         decision = _ask(agent, align_dir / "decision.json", "align",
                             "Compare target and fixed-policy source evidence. Return "
                             '{"aligned":bool,"source_config":{...},"reason":str}. '
                             "If aligned=true keep the model. Otherwise propose source calibration only: "
-                            "mass_scale [0.5,2], friction_scale [0.3,2], controller_duration_scale "
-                            "[0.5,2], camera_offset [dx,dy,dz] each +/-0.05 m. friction_scale uniformly "
+                            "mass_scale [0.5,2], "
+                            f"friction_scale [{FRICTION_SCALE_BOUNDS[0]:g},{FRICTION_SCALE_BOUNDS[1]:g}], controller_duration_scale "
+                            "[0.5,2], camera_offset [dx,dy,dz] each +/-0.05 m. "
+                            "mass_scale multiplies plate masses only, not robot link masses or controller gains. "
+                            "It changes object inertia and contact loads, not unloaded robot dynamics. "
+                            "controller_duration_scale multiplies source move and gripper command durations; "
+                            "wait durations, servo gains and the physics timestep remain unchanged. camera_offset translates "
+                            "both source cameras in their mounting coordinates; returned camera calibration "
+                            "remains consistent with those poses. friction_scale uniformly "
                             "scales source sliding friction for the whole scene (including robot contact "
-                            "geometries), so it changes the effective contact friction. Missing keys preserve "
+                            "geometries), so it changes the effective contact friction. "
+                            f"{_actuator_calibration_help(cfg)}"
+                            "Missing keys preserve "
                             "the current values. Never change this script or toolbox during alignment. "
-                            "Use image and motion evidence; alignment is not success optimization.",
+                            "toolbox contains the exact frozen implementation and skill notes used by "
+                            "both rollouts; inspect its helper semantics when interpreting motion or "
+                            "termination evidence. It is read-only evidence, not a repair proposal. "
+                            "Use image and motion evidence; alignment is not success optimization. "
+                            "First identify the outcome-relevant failure or behavior and its observed "
+                            "phase. Judge whether the source reproduces the object response, triggering "
+                            "observations and policy decisions relevant to that outcome. Identical "
+                            "command counts, timing or intermediate tracking samples are not required "
+                            "when the remaining differences do not change that behavior or undermine "
+                            "the proposed repair tests. Explain their relevance in reason rather than "
+                            "optimizing trace similarity without an outcome-related rationale. An "
+                            "alignment judgment covers only the observed behavior: explicitly retain "
+                            "uncertainty about unexercised contact or placement and other mismatches. "
+                            "alignment_history contains this trial's prior calibration proposals and "
+                            "their completed public replays. Compare observed effects before repeating "
+                            "or reversing an update. Equal failure labels do not establish alignment.",
                             {"task": nominal_task["description"], "script": fixed_script,
+                             "toolbox": _contents(current),
                              "source_config": source_config, "target": _public(target),
-                             "source": _public(source), "task_history": trial_summaries})
+                             "source": _public(source), "task_history": trial_summaries,
+                             "alignment_history": alignment["history"]})
+                        alignment["last_assessment"] = {
+                            "assessed_step": len(alignment["history"]) - 1,
+                            "response": copy.deepcopy(decision)}
                         if decision.get("aligned") is True:
+                            alignment["status"] = "agent_confirmed_aligned"
                             break
-                        update = _calibration(decision.get("source_config", {}))
-                        source_config = _calibration({**source_config, **update})
+                        profile = cfg.get("source_calibration_profile", "basic")
+                        update = _calibration(decision.get("source_config", {}), profile)
+                        source_config = _calibration({**source_config, **update}, profile)
                         source = _run(runner, "mujoco", nominal_task, current,
                                       align_dir / "replay", fixed_script, source_config)
+                        alignment["updates_applied"] += 1
+                        alignment["history"].append({"step": alignment["updates_applied"],
+                            "source_config": copy.deepcopy(source_config),
+                            "proposal": copy.deepcopy(decision), "source": _public(source)})
                 else:
                     _save(trial_dir / "alignment" / "unavailable.json", {
                         "reason": "No policy was produced/executed; no fixed-script replay is possible."})
+                _save(trial_dir / "alignment" / "history.json", alignment)
                 _save(trial_dir / "source_config.json", source_config)
                 hypotheses = _ask(agent, trial_dir / "hypotheses.json", "repair_hypotheses",
                     f"Propose exactly {cfg['repairs']} distinct reusable toolbox repair hypotheses "
-                    'based on target and aligned source evidence. Return {"hypotheses":[str,...]}. '
+                    'based on target and current calibrated source evidence. Return {"hypotheses":[str,...]}. '
                     "Keep alternatives independent; do not modify the simulator further. "
-                    "Use task_history to avoid repeating rejected repairs without new evidence.",
+                    "Use task_history to avoid repeating rejected repairs without new evidence. "
+                    "Consult alignment status and history: exhausting the calibration budget does "
+                    "not confirm behavioral alignment, and a final replay may not have been assessed.",
                     {"task": nominal_task["description"], "toolbox": _contents(current),
                      "script": fixed_script, "target": _public(target),
                      "source": _public(source) if source else None, "source_config": source_config,
-                     "task_history": trial_summaries})
+                     "task_history": trial_summaries, "alignment": alignment})
                 ideas = hypotheses.get("hypotheses")
                 if (not isinstance(ideas, list) or len(ideas) != cfg["repairs"] or
                     any(not isinstance(idea, str) or not idea.strip() for idea in ideas) or
@@ -1307,7 +1453,7 @@ def adapt(runner, agent, run_dir: Path, config: dict) -> dict:
                         {"hypothesis": hypothesis, "toolbox": _contents(current),
                          "task": nominal_task["description"], "script": fixed_script,
                          "target": _public(target), "source": _public(source) if source else None,
-                         "task_history": trial_summaries})
+                         "task_history": trial_summaries, "alignment": alignment})
                     candidate, validation = _candidate(proposal, candidate_dir)
                     candidate_records[candidate_id] = {"hypothesis": hypothesis,
                         "changes": _changes(current, proposal), "validation": validation}
@@ -1318,9 +1464,18 @@ def adapt(runner, agent, run_dir: Path, config: dict) -> dict:
                     "for this same task, varying placements and plausible physical conditions. "
                     "Return {tasks:[...]}. Preserve the supplied success predicate exactly; "
                     "do not weaken the task or invent target simulator parameters. These scenarios "
-                    "will be frozen and shared by current and all repair candidates. " + TASK_SPEC_HELP,
+                    "will be frozen and shared by current and all repair candidates. "
+                    "The supplied source_config is applied after these scene overrides. With the "
+                    "pinned MuJoCo source assets, plate/table sliding friction is max(plate_friction, "
+                    "0.7) and plate/finger sliding friction is max(plate_friction,1.0), then both "
+                    "are multiplied by friction_scale. Material-friction changes below those "
+                    "contact floors do not vary effective contact friction. Choose effective "
+                    "physical contrasts, such as mass or friction beyond the relevant floor, "
+                    "and describe the actual variation rather than labeling unchanged contact "
+                    "friction as a robustness test. " + TASK_SPEC_HELP,
                     {"task_id": task_id, "description": nominal_task["description"],
                      "source_scene_template": nominal_task["scene"],
+                     "source_config": copy.deepcopy(source_config),
                      "required_predicate": nominal_task.get("predicate"),
                      "suggested_source_seeds": [cfg["seed"] + 40000 + task_index * 1000 +
                          trial * 100 + j for j in range(cfg["screen_tasks"])]})
@@ -1344,13 +1499,22 @@ def adapt(runner, agent, run_dir: Path, config: dict) -> dict:
                     'Choose a candidate or retain current using videos/images, traces and scores. '
                     'Return {"selected":"current"|"candidate_00"|...,"reason":str}. '
                     "Simulation scores are supporting evidence, not an automatic objective. Consider "
-                    "target mismatch and robustness; you may reject a high-scoring implausible repair.",
+                    "target mismatch and robustness; you may reject a high-scoring implausible repair. "
+                    "Full-task screen success is useful evidence, not a mandatory selection gate. "
+                    "A local correction may be selected when replay and generalization evidence "
+                    "support its predicted removal of a specific target failure, later failures are "
+                    "separately identified, and material regressions are addressed. Explain that "
+                    "causal evidence and remaining uncertainty; extra arm motion or earlier stopping "
+                    "alone is not an improvement. Failed task outcomes must remain recorded as failures. "
+                    "Use the calibration history and its assessment status to judge remaining mismatch; "
+                    "a completed calibration budget is not evidence that alignment succeeded.",
                     {"hypotheses": hypothesis_map, "candidates": candidate_records,
                      "available_choices": list(candidates), "task_history": trial_summaries,
                      "source_task": nominal_task, "fixed_script": fixed_script,
                      "generalization_tasks": generalization,
                      "toolboxes": {key: _contents(value) for key, value in candidates.items()},
-                     "target": _public(target), "source_config": source_config, "screen": evidence})
+                     "target": _public(target), "source_config": source_config, "screen": evidence,
+                     "alignment": alignment})
                 choice = selected.get("selected")
                 selection_error = None
                 if choice not in candidates:
@@ -1365,6 +1529,7 @@ def adapt(runner, agent, run_dir: Path, config: dict) -> dict:
                            "target_status": target.get("status"), "selected": choice,
                            "reason": selection_error or selected.get("reason"),
                            "agent_reason": selected.get("reason"), "source_config": source_config,
+                           "alignment": _alignment_summary(alignment),
                            "fixed_script_sha256": _digest(fixed_script),
                            "toolbox_sha256": toolbox_hash(current),
                            "target": _outcome_summary(_public(target)),
@@ -1431,10 +1596,15 @@ def _stage1_report(run_dir: Path, manifest: dict, calls: int) -> dict:
     tasks = _json(run_dir / "selection_tasks.json", [])
     auxiliary = _json(run_dir / "auxiliary_selection_tasks.json", [])
     members = []
+    lineage = discovery.get("inherited_stage1")
     for index in range(manifest.get("config", {}).get("population", DEFAULTS["population"])):
         member = {"member": index}
+        inherited = next((row for row in discovery.get("members", []) if row["member"] == index), None) if lineage else None
         for label, suite, frozen in (("selection_results", "selection", tasks),
                                      ("auxiliary_results", "auxiliary_selection", auxiliary)):
+            if inherited:
+                member[label] = copy.deepcopy(inherited[label])
+                continue
             records = []
             for trial, task in enumerate(frozen):
                 out = run_dir / suite / f"member_{index:02d}" / f"{trial:03d}"
@@ -1444,19 +1614,25 @@ def _stage1_report(run_dir: Path, manifest: dict, calls: int) -> dict:
         member["full_task_successes"] = sum(record["success"] for record in member["selection_results"])
         member["auxiliary_successes"] = sum(record["success"] for record in member["auxiliary_results"])
         bank = _json(run_dir / "discovery" / f"member_{index:02d}" / "capability_bank.json", [])
-        member["capability_bank_size"] = len(bank)
+        member["capability_bank_size"] = inherited["capability_bank_size"] if inherited else len(bank)
+        if inherited:
+            member["legacy_predicate_successes"] = inherited["legacy_predicate_successes"]
         members.append(member)
     winner = discovery.get("winner")
     selected = next((member for member in members if member["member"] == winner), None)
     full = selected["full_task_successes"] if selected else 0
+    strict = manifest["config"].get("placement_contract") == "released_placement_v1"
     return {"process_complete": bool(discovery), "winner": winner,
             "full_task_verified": bool(discovery) and full > 0, "full_task_successes": full,
+            "full_task_predicate_verified": bool(discovery) and full > 0,
+            "full_task_verification_scope": "released_placement_v1" if strict else "frozen_task_predicates",
+            "released_placement_verified": bool(discovery) and full > 0 if strict else None,
             "auxiliary_successes": selected["auxiliary_successes"] if selected else None,
             "capability_bank_size": selected["capability_bank_size"] if selected else None,
             "selection_tasks_per_member": len(tasks), "auxiliary_tasks_per_member": len(auxiliary),
             "agent_calls": discovery.get("agent_count", calls),
             "agent_calls_note": "Cumulative budget-charged calls at Stage 1 completion; later phases excluded.",
-            "members": members}
+            "members": members, "inherited_stage1": lineage}
 
 
 def report(run_dir: Path) -> dict:
@@ -1515,6 +1691,8 @@ def report(run_dir: Path) -> dict:
             mismatch_count += mismatch
             task_trials.append({"trial": summary["trial"], "success": summary["target_success"],
                                 "selected": summary["selected"],
+                                "alignment_status": summary.get("alignment", {}).get("status", "not_recorded"),
+                                "calibration_updates": summary.get("alignment", {}).get("updates_applied"),
                                 "source_target_success_disagreement": mismatch,
                                 "selection_record": str(path.parent / "repair_selection.json")})
         traces[task_id] = task_trials
@@ -1559,6 +1737,8 @@ def report(run_dir: Path) -> dict:
               "protocol_complete": protocol_complete,
               "engineering_evidence_complete": engineering_evidence_complete,
               "complete": protocol_complete and engineering_evidence_complete,
+              "completion_scope": "Scheduled protocol and execution provenance, not capability or release verification.",
+              "success_definition": "Frozen task predicates; gripper opening, withdrawal and contact release require separate audit.",
               "source_rollout_statuses": dict(source_statuses),
               "source_rollout_activity": dict(source_activity),
               "source_attempt_statuses": dict(source_attempt_statuses),
@@ -1572,39 +1752,64 @@ def report(run_dir: Path) -> dict:
               "adaptation_trace": traces, "source_target_success_disagreements": mismatch_count,
               "coding": coding}
     result["stage1"] = _stage1_report(run_dir, manifest, result["agent_budget_used"])
+    lineage = result["stage1"].get("inherited_stage1") or {}
+    result["agent_budget_inherited"] = lineage.get("parent_agent_budget_used", 0)
+    result["agent_budget_total_used"] = result["agent_budget_inherited"] + result["agent_budget_used"]
+    strict = manifest["config"].get("placement_contract") == "released_placement_v1"
+    if strict:
+        result["success_definition"] = (
+            "released_placement_v1: lift, full containment and distractor exclusion, plus measured opening, "
+            "withdrawal, hand/object separation and a complete settled post-opening window.")
     result["agent_calls_note"] = ("All recorded attempts, including budget-exempt network failures; "
                                   "token totals include all provider-reported usage.")
     _save(run_dir / "report.json", result)
     stage1 = result["stage1"]
     text = ["# SimEX 本地初步复现报告", "",
             "Stage 1 流程：" + ("已完成。" if stage1["process_complete"] else "未完成。"),
-            f"Stage 1 所选成员：{stage1['winner']}；完整入箱成功 {stage1['full_task_successes']} / "
-            f"{stage1['selection_tasks_per_member']}；共同基础能力选择任务成功 "
-            f"{stage1['auxiliary_successes']} / {stage1['auxiliary_tasks_per_member']}。",
+            (f"Stage 1 所选成员：{stage1['winner']}；入箱判据通过 {stage1['full_task_successes']} / "
+             f"{stage1['selection_tasks_per_member']}；共同基础能力选择任务成功 "
+             f"{stage1['auxiliary_successes']} / {stage1['auxiliary_tasks_per_member']}。"
+             if stage1["winner"] is not None else "Stage 1 尚未完成成员选拔；完整任务判据通过率待评估。"),
             f"截至 Stage 1 的累计模型预算用量：{stage1['agent_calls']}；所选成员历史成功任务数："
             f"{stage1['capability_bank_size']}。历史成功任务包含自生成子任务，不能等同于完整入箱。",
-            "Stage 1 已出现独立完整入箱成功。" if stage1["full_task_verified"] else "尚未验证完整入箱能力。",
-            "", "| 成员 | 类型 | 场景/种子 | 状态 | 成功 | 视频/记录 |",
+            ("Stage 1 已通过版本化释放判据；录像仍保留供人工复核。" if strict else
+             "Stage 1 已出现入箱判据通过；释放与撤手仍需单独核对。")
+            if stage1["full_task_predicate_verified"] else "尚未验证完整入箱能力。",
+            ("本运行采用 released_placement_v1：开爪至少 6 cm、撤手至少 5 cm、TCP 与盘心分离"
+             "至少盘子半径加 5 cm，最后半秒持续入箱、张爪、低速且位置漂移不超过 5 mm。"
+             if strict else
+             "原入箱判据检查抬升、盘子包围体入箱和末速度，不检查打开夹爪、撤手或脱离接触。"
+             "以下得分不等同于完成释放放置；另用 scripts/audit_placement.py 和录像核对。"),
+            "", "| 成员 | 类型 | 场景/种子 | 状态 | 判据通过 | 视频/记录 |",
             "|---:|---|---|---|---|---|"]
+    if lineage:
+        text[2:2] = [
+            f"Stage 1 继承自 `{lineage['parent_run']}`：仅对既有选拔轨迹重新评分，没有重新训练或生成源策略。",
+            f"原评分选择成员 {lineage['legacy_winner']}，释放判据选择成员 {lineage['release_winner']}。"
+            f"继承的模型预算用量为 {lineage['parent_agent_budget_used']}，后续剩余预算为 "
+            f"{lineage['continuation_model_budget']}。", ""]
     for member in stage1["members"]:
-        for label, kind in (("selection_results", "完整入箱"), ("auxiliary_results", "基础能力")):
+        for label, kind in (("selection_results", "入箱判据"), ("auxiliary_results", "基础能力")):
             for record in member[label]:
                 video = record.get("video")
                 artifact = f"[视频]({video})" if video else f"[记录]({record['output_dir']})"
                 text.append(f"| {member['member']} | {kind} | {record['task']} / {record['seed']} | "
-                            f"{record['status']} | {'是' if record['success'] else '否'} | {artifact} |")
+                            f"{record['status']} | "
+                            f"{'待评估' if record['status'] == 'pending' else '是' if record['success'] else '否'} | {artifact} |")
     text.extend(["", f"目标仿真：已完成 {result['target_completed']} / {result['target_scheduled']} 个排定试验。",
             "结果状态：" + ("流程及物理执行证据完整。" if result["complete"] else
                            "预算已执行完，但有效物理执行证据不足，不能判定工程验收完整。"
                            if protocol_complete else "未完成；不把缺失试验计为实测失败。"), "",
-            "| 方法 | 任务 | 成功/排定 | 已完成 | 成功率 |",
+            "| 方法 | 任务 | 判据通过/排定 | 已完成 | 判据通过率 |",
             "|---|---|---:|---:|---:|"])
     for row in rows:
         rate = "未完成" if row["success_rate"] is None else f"{row['success_rate']:.1%}"
         text.append(f"| {row['method']} | {row['task_id']} | {row['successes']}/{row['scheduled']} | "
                     f"{row['completed']} | {rate} |")
     text.extend(["", "本实验采用单臂 Franka Panda、三个改编搬盘任务、缩小的种群与迭代预算，"
-                 "每轮候选及筛选场景数量见 manifest.json。研究运行次数为 1；模型由本机 Codex 配置决定。",
+                 "每轮候选及筛选场景数量见 manifest.json。研究运行次数为 1；"
+                 f"记录模型为 {', '.join(sorted(models)) or manifest['config'].get('model', '未记录')}，"
+                 "阶段推理等级和超时见 manifest.json。",
                  "本报告不将完整执行等同于方法改善，也不宣称复现论文的 94% 成功率。",
                  "", "每次目标记录、固定脚本源重放、校准配置、候选证据和代理选择理由保存在 adaptation/；"
                  "最终评估独立保存在 evaluation/，不再反馈给优化代理。",
@@ -1639,6 +1844,8 @@ def report(run_dir: Path) -> dict:
         if trace:
             outcomes = " → ".join("成功" if item["success"] else "失败" for item in trace)
             selections = ", ".join(item["selected"] for item in trace)
-            text.append(f"- {task_id} 目标试验结果：{outcomes}；各轮选择：{selections}。")
+            alignments = ", ".join(item["alignment_status"] for item in trace)
+            text.append(f"- {task_id} 目标试验结果：{outcomes}；各轮选择：{selections}；"
+                        f"对齐评估状态：{alignments}。")
     (run_dir / "report.md").write_text("\n".join(text) + "\n")
     return result

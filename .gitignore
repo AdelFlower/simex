@@ -19,4 +19,9 @@ tests/*
 !tests/test_fetch_panda.py
 !tests/test_coding.py
 !tests/test_initial_geometry.py
+!tests/test_placement_audit.py
+!tests/test_release_contract.py
+!tests/test_stage1_continuation.py
+!tests/test_source_actuator_calibration.py
+!tests/test_temporal_predicates.py
 direct_plate/

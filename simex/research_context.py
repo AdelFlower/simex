@@ -10,21 +10,21 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 from pathlib import Path
 
+from .evidence import _diagnostic_line
+from .research_limits import MAX_IMAGES, MAX_PROMPT_CHARS
 from .storage import atomic_json
 
 VERSION = 1
-MAX_PROMPT_CHARS = 64_000
 SUMMARY_CHARS = 34_000
 READ_CHARS = 16_000
 MAX_INTERACTIONS = 20
 MAX_READ_ROUNDS = MAX_INTERACTIONS - 1
 MAX_READ_REQUESTS = 4
-MAX_IMAGES = 4
 MAX_NOTES_CHARS = 2_000
-MAX_PINNED_CHARS = 30_000
+MAX_PINNED_CHARS = 64_000
+MAX_FULL_FILE_CHARS = 30_000
 RESEARCH_ROLES = frozenset(("discover_probe", "discover_focus", "discover_revision",
     "discover_select", "discover_code", "align", "repair_hypotheses", "repair", "screen_tasks", "repair_select"))
 
@@ -35,14 +35,13 @@ references, NOT complete evidence. All rollouts retain their status and scores;
 omitted text is available through the read protocol, not through filesystem tools.
 To inspect details instead of making your decision yet, return ONLY:
 {"evidence_requests":[{"id":"text_...","offset":0,"limit":8000}],"notes":"concise findings to carry forward"}
-For an image use {"id":"image_..."}. For text you may supply "find":"literal
-substring" to locate a relevant section; the returned page starts at that match.
-Image catalogs list the IDs of original frames available on demand. Read robot_trace
-for individual robot-state samples that are not retained in motion_summary.
+For images use {"id":"image_..."}; catalogs list available original frames.
+For text, "find":"literal substring" starts the page at that match.
+Read robot_trace for robot-state samples omitted from motion_summary.
 Use only listed IDs, at most 4 requests per round and 16000 returned JSON characters
-per round. Full code may span multiple pages. Do not reconstruct omitted code from
-an excerpt: read the relevant implementation before revising it. Distinguish an
-excerpt from a full execution log, and an unviewed image from visual evidence.
+per round. Full code may span pages. Read relevant implementation before revising
+it; never reconstruct omitted code. Excerpts are not full logs; unviewed images
+are not visual evidence.
 """ f"There are at most {MAX_READ_ROUNDS} read rounds and {MAX_INTERACTIONS} interactions in total, including the final decision.\n"
 """The latest notes (at most
 2000 characters) and latest read results replace earlier pages; they do not append
@@ -52,14 +51,22 @@ When ready, return the originally requested decision JSON without evidence_reque
 action_summary describes public commands and robot motion only. A close command,
 TCP rise, or subsequent opening does not establish object contact, a grasp, or
 placement success. tcp_rise_after_close_m stops at the next opening command;
+first_close_response measures aperture at close-command return and the next arm
+action. Command return does not establish finger settling.
 last_motion_rejection with source=policy_stdout is a reported diagnosis, while
 source=action_result is an API failure flag that measured-pose checking may accept.
+last_cartesian_command_tracking compares the last raw move_ee command with its
+endpoint and latest public robot sample. The raw command may include an intentional
+feedback offset from the policy's nominal target. A persistent residual at low
+joint velocity is not merely evidence of unfinished settling; it does not by
+itself identify tracking bias, contact, obstruction, or task failure.
 Use the independent task outcome and phase images to assess the manipulation.
 """).strip()
 
 EDIT_INSTRUCTIONS = """
-Output override for a capability library too large to include in full:
-Read the relevant source pages by evidence_id, then return
+Output override: use exact block edits for this capability library.
+Use the complete visible source, or read relevant referenced pages by evidence_id,
+then return
 {"edits":[{"file":"toolbox.py","old":"exact existing source block","new":"replacement block"}],"hypothesis":"..."}.
 You may edit only toolbox.py and skill.md, with at most 16 edits. Each nonempty
 old block must match EXACTLY ONCE in the current file after previous edits.
@@ -70,12 +77,20 @@ excerpts. A bad edit is an invalid candidate, not a reason to retry generation.
 
 
 def prepare_edit_context(role, instruction, payload):
-    """Full small libraries; exact block edits for larger libraries."""
+    """Keep bounded current source visible without changing read-only outputs."""
+    if role in ("align", "repair_hypotheses"):
+        library = payload.get("toolbox")
+        complete = (isinstance(library, dict) and set(library) == {"toolbox.py", "skill.md"}
+                    and all(isinstance(value, str) for value in library.values()))
+        pinned = ("toolbox",) if complete and len(dumps(library)) <= MAX_PINNED_CHARS else ()
+        return instruction, pinned, False
     if role not in ("discover_revision", "repair"):
         return instruction, (), False
-    if len(dumps(payload.get("toolbox", {}))) <= MAX_PINNED_CHARS:
+    chars = len(dumps(payload.get("toolbox", {})))
+    if chars <= MAX_FULL_FILE_CHARS:
         return instruction, ("toolbox",), False
-    return instruction + "\n\n" + EDIT_INSTRUCTIONS, (), True
+    pinned = ("toolbox",) if chars <= MAX_PINNED_CHARS else ()
+    return instruction + "\n\n" + EDIT_INSTRUCTIONS, pinned, True
 
 
 def apply_source_edits(response, current):
@@ -218,6 +233,51 @@ class ResearchContext:
                             excerpts(child)
                 excerpts(self.summary)
                 if not candidates:
+                    compactable = []
+                    def collect_details(value):
+                        if isinstance(value, dict):
+                            if ("full_result" in value and "evidence" in value
+                                    and not value.get("detail_overview")):
+                                compactable.append(value)
+                            else:
+                                for child in value.values():
+                                    collect_details(child)
+                        elif isinstance(value, list):
+                            for child in value:
+                                collect_details(child)
+                    collect_details(self.summary)
+                    if compactable:
+                        self._compact_rollout(max(compactable, key=lambda item: len(dumps(item))))
+                        continue
+                    # Task/scene catalogs can themselves exceed the remaining
+                    # room. Page these structured values without dropping any
+                    # rollout outcome. The stored index retains all child IDs.
+                    structured = []
+                    def has_outcome(value):
+                        if isinstance(value, dict):
+                            return ("status" in value and "success" in value) or any(
+                                has_outcome(child) for child in value.values())
+                        return isinstance(value, list) and any(has_outcome(child) for child in value)
+                    def collect_structured(value, label):
+                        if isinstance(value, dict) and "evidence_id" not in value:
+                            for key, child in value.items():
+                                if (isinstance(child, (dict, list)) and len(dumps(child)) > 250
+                                        and not (isinstance(child, dict) and "evidence_id" in child)
+                                        and not has_outcome(child) and key not in
+                                        ("action_summary", "execution", "evidence", "read_history", "recent")):
+                                    structured.append((len(dumps(child)), value, key, label + "." + key))
+                                else:
+                                    collect_structured(child, label + "." + key)
+                        elif isinstance(value, list):
+                            for index, child in enumerate(value):
+                                collect_structured(child, f"{label}[{index}]")
+                    collect_structured(self.summary, "input")
+                    if structured:
+                        _, parent, key, label = max(structured, key=lambda item: item[0])
+                        value = parent[key]
+                        parent[key] = self._text_ref(dumps(value), label, preview=0,
+                                                    kind="structured", count=len(value))
+                        continue
                     raise ContextError("Research overview exceeds its character budget; refusing an oversized model request")
             _, parent, key, label = max(candidates, key=lambda item: item[0])
             parent[key] = (self._text_ref(parent[key], label, preview=120) if label is not None else
@@ -255,9 +315,9 @@ class ResearchContext:
             if len(value) > threshold:
                 result = self._text_ref(value, label, preview=320)
                 if key == "stdout":
-                    matches = list(re.finditer(r"(?im)^.*(?:STOP|FAIL|ERROR|ABORT|UNREACHABLE).*$", value))
-                    if matches:
-                        result["last_diagnostic_line"] = matches[-1].group(0)[:320]
+                    diagnostic = _diagnostic_line(value)
+                    if diagnostic:
+                        result["last_diagnostic_line"] = diagnostic
                 return result
             return value
         if isinstance(value, list):
@@ -351,9 +411,9 @@ class ResearchContext:
             visible["stdout"] = (stdout if len(stdout) <= 400 else
                 self._text_ref(stdout, label + ".evidence.stdout", preview=240))
             if isinstance(visible['stdout'], dict):
-                matches = list(re.finditer(r"(?im)^.*(?:STOP|FAIL|ERROR|ABORT|UNREACHABLE).*$", stdout))
-                if matches:
-                    visible['stdout']['last_diagnostic_line'] = matches[-1].group(0)[:320]
+                diagnostic = _diagnostic_line(stdout)
+                if diagnostic:
+                    visible['stdout']['last_diagnostic_line'] = diagnostic
         motion = evidence.get("motion_summary", {})
         if motion:
             visible["motion_summary"] = {key: motion[key] for key in
@@ -399,6 +459,42 @@ class ResearchContext:
             if isinstance(script, dict):
                 value["execution"]["script"] = {"evidence_id": script["evidence_id"]}
         value["brief_overview"] = True  # omitted fields are in full_result
+
+    def _compact_rollout(self, value):
+        """Page detailed indexes too, while keeping every outcome and activity visible.
+
+        A pinned library can leave only 16k characters for twelve rollouts. Even
+        tiny individual frame/trace references then overflow the overview. Store
+        the existing index, including its readable IDs, before reducing it.
+        """
+        details = self._text_ref(dumps(value), "rollout.detail_overview", preview=0)
+        evidence = value["evidence"]
+        activity = evidence.get("action_summary", {})
+        retained = {key: activity[key] for key in (
+            "classification", "arm_commands", "gripper_commands", "arm_motion_observed",
+            "close_commands", "open_commands", "min_tcp_height_m", "tcp_rise_after_close_m",
+            "last_cartesian_command_tracking",
+        ) if key in activity}
+        closure = activity.get("first_close_response")
+        if isinstance(closure, dict):
+            # Keep the closure/arm transition visible even in the smallest row.
+            # The complete endpoint and command details remain in detail_overview.
+            retained["first_close_response"] = {key: closure.get(key) for key in (
+                "action_index", "endpoint_width_m", "next_arm_delay_s", "next_arm_start_width_m")}
+        outcome = {key: value[key] for key in ("status", "success", "steps") if key in value}
+        # The detail index already contains full_result and execution/script IDs.
+        # Repeating those beside every compact row wastes the small budget left
+        # by a pinned library, especially when test feedback repeats a baseline.
+        value.clear()
+        value.update(outcome)
+        value["evidence"] = {"action_summary": retained}
+        if evidence.get("reason"):
+            value["evidence"]["reason"] = evidence["reason"]
+        # Keep this final fallback lean even when the same trials occur in both
+        # the baseline and candidate feedback. The stage label is recoverable
+        # from details; the observed counts and motion remain visible above.
+        # Reference size/excerpt metadata is redundant for an index with no text.
+        value["detail_overview"] = {"evidence_id": details["evidence_id"]}
 
     def persist(self, directory):
         """Freeze approved blobs independently of the model's temporary sandbox."""

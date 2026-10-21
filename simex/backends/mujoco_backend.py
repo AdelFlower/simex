@@ -65,6 +65,12 @@ class MujocoBackend:
         gripper_actuator = root.find("actuator/general[@name='actuator8']")
         gripper_actuator.set("gainprm", _vec([2000 * .04 / 255, 0, 0]))
         gripper_actuator.set("biasprm", "0 -2000 -20")
+        physics = scene.get("physics", {})
+        if "gripper_stiffness_scale" in physics or "gripper_damping_scale" in physics:
+            stiffness = 2000 * physics.get("gripper_stiffness_scale", 1.)
+            damping = 20 * physics.get("gripper_damping_scale", 1.)
+            gripper_actuator.set("gainprm", _vec([stiffness * .04 / 255, 0, 0]))
+            gripper_actuator.set("biasprm", _vec([0, -stiffness, -damping]))
         option = root.find("option")
         option.set("timestep", str(scene.get("physics", {}).get("dt", 1 / 240)))
         option.set("gravity", "0 0 -9.81")
@@ -286,6 +292,11 @@ class MujocoBackend:
             phase = index / steps
             blend = phase**3 * (10 - 15 * phase + 6 * phase**2)
             self.data.ctrl[:7] = start + blend * (target - start)
+            self._step()
+        # Source alignment can model an additive arm settling interval without
+        # changing the commanded trajectory or the gripper/wait durations.
+        settle = self.scene['physics'].get('arm_settle_s', 0.)
+        for _ in range(math.ceil(settle / self.model.opt.timestep)):
             self._step()
         error = float(np.max(np.abs(self.data.qpos[self._qpos_indices] - target)))
         return {"success": error < .08, "joint_error": error, "clamped": bool(np.any(target != requested)), **self.state()}

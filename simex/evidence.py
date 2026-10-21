@@ -6,6 +6,7 @@ any hidden simulator state.
 """
 from __future__ import annotations
 
+import ast
 import json
 import math
 import re
@@ -61,9 +62,40 @@ def _diagnostic_line(stdout, motion=False):
         return None
     failure = re.compile(r'stop|fail|abort|unreachable|reject|exhaust|'
                          r'(?:tracking|motion|pose|joint)\s+error|\b[A-Za-z]*Error:|^\s*ERROR(?:\s|:)', re.I)
-    movement = re.compile(r'mov|motion|track|segment|approach|pose|reach|joint|guard|correction', re.I)
+    movement = re.compile(r'mov|motion|track|segment|approach|pose|reach|joint|guard|correction|'
+                          r'descent|ascent|withdraw|rotation|orientation', re.I)
     for line in reversed(stdout.splitlines()):
-        if failure.search(line) and (not motion or movement.search(line)):
+        record = {}
+        brace = line.find('{')
+        if brace >= 0 and len(line) <= 32_000:
+            # Read only literal top-level fields. Nested attempts can fail before
+            # a controller accepts the final pose; their text is not the outcome
+            # of this operation. Never evaluate log expressions.
+            try:
+                payload = line[brace:]
+                try:
+                    parsed = json.loads(payload)
+                    if isinstance(parsed, dict):
+                        record = parsed
+                except json.JSONDecodeError:
+                    node = ast.parse(payload, mode='eval').body
+                    if isinstance(node, ast.Dict):
+                        record = {key.value: value.value for key, value in zip(node.keys, node.values)
+                                  if isinstance(key, ast.Constant) and isinstance(key.value, str)
+                                  and isinstance(value, ast.Constant)}
+            except (SyntaxError, ValueError, RecursionError):
+                pass
+        explicit_stop = re.match(r'^\s*(?:STOP|FAIL|ERROR|ABORT|UNREACHABLE)(?:\b|_)', line, re.I)
+        reported_event = record.get('event', '')
+        if isinstance(reported_event, str):
+            explicit_stop = explicit_stop or re.match(
+                r'^(?:STOP|FAIL|ERROR|ABORT|UNREACHABLE)(?:\b|_)', reported_event, re.I)
+        accepted = record.get('success') is True or record.get('status') in (
+            'success', 'succeeded', 'reached', 'accepted', 'complete', 'completed')
+        if accepted and not explicit_stop:
+            continue
+        failed = record.get('success') is False or failure.search(line)
+        if failed and (not motion or movement.search(line)):
             return line.strip()[:320]
     return None
 
@@ -80,7 +112,8 @@ def _termination(evidence):
     if isinstance(reason, str) and reason.strip():
         result.update(reason=_diagnostic_line(reason) or reason.strip()[:320], source='execution_reason')
     else:
-        line = _diagnostic_line(evidence.get('stdout'))
+        # A recovered earlier error is not the termination of a successful task.
+        line = _diagnostic_line(evidence.get('stdout')) if status != 'success' else None
         if line:
             # A log line reports the policy's interpretation, not a certified
             # failure cause. The actual execution status remains separate.
@@ -91,6 +124,103 @@ def _termination(evidence):
                        'completed': 'Policy returned.'}
             result.update(reason=reasons[status], source='execution_status')
     return result
+
+
+def _last_cartesian_tracking(actions, states):
+    """Compare public poses with the last raw arm command, without diagnosing cause."""
+    arm = [(i, a) for i, a in enumerate(actions) if isinstance(a, dict)
+           and a.get('method') in ('move_ee', 'move_joints')]
+    if not arm or arm[-1][1]['method'] != 'move_ee':
+        return None
+    index, action = arm[-1]
+    arguments = action.get('arguments', action.get('kwargs', {}))
+    target = arguments.get('position') if isinstance(arguments, dict) else None
+    if not _vector(target, 3):
+        return None
+    _, endpoint = _endpoints(action)
+    end_time = endpoint.get('sim_time')
+
+    def residual(state):
+        position = state.get('ee_position')
+        if not _vector(position, 3):
+            return None
+        delta = [float(a - b) for a, b in zip(position, target)]
+        if not all(math.isfinite(v) for v in delta):
+            return None
+        result = {'actual_minus_command_m': delta, 'position_error_m': math.hypot(*delta)}
+        time = state.get('sim_time')
+        if _number(time) and _number(end_time) and time >= end_time:
+            result['seconds_after_action_end'] = float(time - end_time)
+        velocities = state.get('joint_velocities')
+        if _vector(velocities, 7):
+            result['max_abs_joint_velocity_rad_s'] = max(abs(v) for v in velocities)
+        return result
+
+    later = [s for s in states if isinstance(s, dict) and _number(s.get('sim_time'))
+             and _number(end_time) and s['sim_time'] >= end_time
+             and _vector(s.get('ee_position'), 3)]
+    final = max(later, key=lambda s: s['sim_time']) if later else None
+    return {'action_index': index, 'reference': 'raw_move_ee_command_not_policy_nominal_target',
+            'command_position_m': list(target),
+            'action_endpoint': residual(endpoint),
+            'last_observed': residual(final) if final is not None else None,
+            'api_result': public_action_result(action.get('result'))}
+
+
+def _first_close_response(actions):
+    """Expose closure/arm timing without interpreting aperture as contact.
+
+    Only the first closing command is summarized. A subsequent gripper command
+    ends this interval; waits and observations do not. All other commands remain
+    available in the public action record.
+    """
+    def value(state, key):
+        number = state.get(key)
+        return float(number) if _number(number) else None
+
+    def elapsed(start, end):
+        if _number(start) and _number(end) and end >= start:
+            delta = end - start
+            return float(delta) if _number(delta) else None
+        return None
+
+    for index, action in enumerate(actions):
+        if not isinstance(action, dict) or action.get('method') != 'gripper':
+            continue
+        if _gripper_direction(action) != 'close':
+            continue
+        before, after = _endpoints(action)
+        arguments = action.get('arguments', action.get('kwargs', {}))
+        result = {'action_index': index,
+                  'command_width_m': value(arguments, 'width'),
+                  'command_force_n': value(arguments, 'force'),
+                  'requested_duration_s': value(arguments, 'duration'),
+                  'measured_duration_s': elapsed(before.get('sim_time'), after.get('sim_time')),
+                  'start_width_m': value(before, 'gripper_width'),
+                  'endpoint_width_m': value(after, 'gripper_width'),
+                  'next_arm_delay_s': None, 'next_arm_start_width_m': None,
+                  'next_arm_endpoint': None}
+        for next_index in range(index + 1, len(actions)):
+            following = actions[next_index]
+            if not isinstance(following, dict):
+                continue
+            if following.get('method') == 'gripper':
+                break
+            if following.get('method') not in ('move_ee', 'move_joints'):
+                continue
+            start, end = _endpoints(following)
+            result['next_arm_delay_s'] = elapsed(after.get('sim_time'), start.get('sim_time'))
+            result['next_arm_start_width_m'] = value(start, 'gripper_width')
+            a, b = start.get('ee_position'), end.get('ee_position')
+            delta = [float(y - x) for x, y in zip(a, b)] if _vector(a, 3) and _vector(b, 3) else None
+            result['next_arm_endpoint'] = {
+                'action_index': next_index, 'method': following['method'],
+                'width_m': value(end, 'gripper_width'),
+                'tcp_delta_m': delta if delta is None or all(math.isfinite(x) for x in delta) else None,
+                'measured_duration_s': elapsed(start.get('sim_time'), end.get('sim_time'))}
+            break
+        return result
+    return None
 
 
 def action_summary(evidence, states=None):
@@ -107,8 +237,12 @@ def action_summary(evidence, states=None):
                 'gripper_commands': None, 'arm_motion_observed': None,
                 'command_stage': 'unavailable', 'close_commands': None, 'open_commands': None,
                 'min_tcp_height_m': None, 'tcp_rise_after_close_m': None,
-                'last_motion_rejection': None, 'termination': termination}
+                'first_close_response': None,
+                'last_motion_rejection': None, 'last_cartesian_command_tracking': None,
+                'termination': termination}
     actions = evidence['actions']
+    states = states if states is not None else evidence.get(
+        'robot_trace', evidence.get('trace_tail', evidence.get('robot_trace_tail', [])))
     counts = {name: 0 for name in MOTION_METHODS}
     directions = {'close': 0, 'open': 0, 'hold': 0, 'unknown': 0}
     travel, moved, opened_after_close = 0., False, False
@@ -169,7 +303,7 @@ def action_summary(evidence, states=None):
             if norm > 0 and math.isfinite(norm):
                 angle = 2 * math.acos(min(1., abs(sum(x*y for x, y in zip(a, b))) / norm))
                 moved |= angle > .005
-    for state in states if states is not None else evidence.get('trace_tail', evidence.get('robot_trace_tail', [])):
+    for state in states:
         if not isinstance(state, dict) or not _vector(state.get('ee_position'), 3):
             continue
         height, time = float(state['ee_position'][2]), state.get('sim_time')
@@ -200,6 +334,8 @@ def action_summary(evidence, states=None):
             'hold_commands': directions['hold'], 'unknown_gripper_commands': directions['unknown'],
             'min_tcp_height_m': min(heights) if heights else None,
             'tcp_rise_after_close_m': rise, 'command_stage': stage,
+            'first_close_response': _first_close_response(actions),
+            'last_cartesian_command_tracking': _last_cartesian_tracking(actions, states),
             'last_motion_rejection': last_rejection, 'termination': termination}
 
 
@@ -381,7 +517,7 @@ def summarize_public_evidence(evidence: dict, output_dir: str | None) -> dict:
                         **({"result": public_action_result(action["result"])} if "result" in action else {}),
                         **({"error": "Action failed; see the public execution status."} if action.get("error") else {})})
     sources = [p for p in [trace, video, *images, *(p for _, p in action_images)] if p is not None]
-    source_metadata = {"version": 3,
+    source_metadata = {"version": 6,
         "files": [[str(p), p.stat().st_size, p.stat().st_mtime_ns] for p in sources],
         "actions": actions, "diagnostics": {k: evidence.get(k) for k in ('status', 'reason', 'stdout')}}
     # Compare ordinary cache metadata, never stored content hashes.

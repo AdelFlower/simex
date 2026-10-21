@@ -9,7 +9,7 @@ from pathlib import Path
 from . import research as r
 from .agent import Agent, AgentBudgetExhausted, AgentResponseError, AgentTransportError
 from .research_context import (
-    ContextError, MAX_NOTES_CHARS, MAX_PINNED_CHARS, MAX_PROMPT_CHARS,
+    ContextError, MAX_FULL_FILE_CHARS, MAX_NOTES_CHARS, MAX_PINNED_CHARS, MAX_PROMPT_CHARS,
     READ_CHARS, ResearchContext, apply_source_edits, dumps,
 )
 
@@ -35,6 +35,29 @@ Read only listed evidence IDs: at most 4 reads, 16000 returned JSON characters a
 may use "find":"literal substring". Excerpts are incomplete; read relevant source
 before editing. Old IDs remain readable. Only the latest read pages are attached;
 carry findings in notes. Full operation history is available via coding_history.
+read_history lists ranges already delivered and repeated/empty reads. Use actual
+returned end offsets; a requested limit does not mean that many characters arrived.
+Prefer one or two targeted reads, using find for the relevant function or failure.
+Notes must preserve concrete new observations and their evidence IDs, not repeat
+the general rules. Once the evidence supports a testable mechanism, make a small
+edit and test it. Do not exhaustively reread similar failures before trying a repair.
+Reserve interactions for edit, test and decide; reading alone acquires no capability.
+
+Accumulate executable capabilities, as well as guidance. When fresh policies
+reimplement the same multi-step perception or manipulation routine inconsistently,
+use the successful and failed executions to identify a shared procedure and
+factor it into a reusable toolbox helper. A small parameter edit is useful when
+it addresses the mechanism; adding a helper is appropriate when the missing
+capability is a procedure. Repeated prose-only revisions are not a substitute
+for an implemented procedure when the evidence supports one. Derive object
+targets from runtime RGBD, preserve measured uncertainty and bounded recovery,
+and document the helper's preconditions, postconditions and remaining work.
+Do not store a whole successful task script, its fixture coordinates or its
+particular scene as a capability. Test through fresh policies and verify that
+they actually exercise the new helper before attributing outcomes to it.
+peer_experiment_summaries are the same summaries frozen at this cycle's probe
+boundary. Use their ideas for independent implementation and testing; a peer's
+success is not this member's demonstrated capability. No peer implementation is available.
 
 Edit only toolbox.py and skill.md. Full files are allowed only when
 edit_mode=full_or_edits; otherwise use 1 to 16 exact replacements. Each nonempty
@@ -48,6 +71,11 @@ and replay task set with fresh one-shot policies. Repeating a test for the same
 draft returns saved evidence. A test must leave a subsequent interaction for a
 decision. Test results include executed scripts, action summaries and public
 evidence. Read them before deciding; robot motion alone does not prove acquisition.
+Top-level results describe the accepted version. latest_test persistently contains
+the most recent tested draft's results, its baseline_results, regression and IDs,
+even after intervening reads or edits. Check its draft_id against working_draft:
+editing after that test leaves the new draft untested. Default images come from
+latest_test.results when available; do not confuse baseline and candidate evidence.
 
 Decide only about the current tested draft. An edit after testing requires another
 test. Accept only a plausible reusable improvement supported by observed behavior
@@ -145,6 +173,47 @@ def session_history(directory):
     return history
 
 
+def read_history(history, limit=12):
+    """Bounded coverage memory across the otherwise stateless model calls."""
+    seen, operations, consecutive = {}, 0, 0
+    for turn in history:
+        response = turn.get("response")
+        action = response.get("action") if isinstance(response, dict) else None
+        if action != "read":
+            if action in ("edit", "test", "decide", "reset", "finish"):
+                consecutive = 0
+            continue
+        operations += 1
+        consecutive += 1
+        for item in turn.get("feedback", {}).get("reads", []):
+            identifier = item.get("id")
+            start, end = item.get("offset"), item.get("end")
+            if not isinstance(identifier, str) or type(start) is not int or type(end) is not int:
+                continue
+            record = seen.pop(identifier, {"id": identifier, "ranges": [], "requests": 0,
+                                           "repeated_reads": 0, "empty_pages": 0})
+            record["requests"] += 1
+            if end <= start:
+                record["empty_pages"] += 1
+            else:
+                record["repeated_reads"] += any(a <= start and end <= b for a, b in record["ranges"])
+                merged = []
+                for a, b in sorted(record["ranges"] + [[start, end]]):
+                    if merged and a <= merged[-1][1]:
+                        merged[-1][1] = max(merged[-1][1], b)
+                    else:
+                        merged.append([a, b])
+                record["ranges"] = merged
+            seen[identifier] = record
+    recent = []
+    for record in list(seen.values())[-limit:]:
+        # Coverage remains exact; omitted disjoint ranges are explicitly counted.
+        recent.append({**record, "ranges": record["ranges"][-4:],
+                       "omitted_ranges": max(0, len(record["ranges"]) - 4)})
+    return {"read_operations": operations, "consecutive_reads": consecutive,
+            "omitted_ids": max(0, len(seen) - limit), "recent": recent}
+
+
 class CodingSession:
     def __init__(self, runner, agent, directory, cfg, initial, payload, tasks, focused, replay, cycle):
         self.runner, self.agent = runner, agent
@@ -178,6 +247,11 @@ class CodingSession:
                 break
             self.state = record["after"]
         self.state = self._restore_state(self.state, self.baseline_results)
+        if not any(item.get("kind") == "image" and item.get("attached")
+                   for item in self.state["read_results"]):
+            # Older checkpoints cached default baseline images after text reads.
+            # Only explicitly requested images should override current defaults.
+            self.state["image_ids"] = None
         self.context = None
 
     def _checkpoint_state(self, state):
@@ -211,9 +285,18 @@ class CodingSession:
     def _context(self):
         state = self.state
         files = r._contents(Path(state["drafts"][state["draft_id"]]["path"]))
-        small = len(dumps(files)) <= MAX_PINNED_CHARS
+        source_chars = len(dumps(files))
+        small = source_chars <= MAX_FULL_FILE_CHARS
         tests = [{"test_id": item["id"], "draft_id": item["draft_id"], "status": item["status"],
                   "decision": item.get("decision")} for item in state["tests"]]
+        history = session_history(self.directory)
+        latest_test = self._test_feedback(state["tests"][-1]) if state["tests"] else None
+        feedback = state["last_feedback"]
+        if latest_test and feedback.get("test_id") == latest_test["test_id"]:
+            # Keep one durable copy of each result set; a read must not make the
+            # latest experiment disappear into the paged operation history.
+            feedback = {key: value for key, value in feedback.items()
+                        if key not in ("results", "baseline_results")}
         payload = {**self.payload, "toolbox": files, "working_draft": state["draft_id"],
                    "accepted_draft": state["current_id"],
                    "accepted_toolbox": r._contents(Path(state["current"])),
@@ -222,15 +305,16 @@ class CodingSession:
                    "remaining_interactions": self.max_turns - state["turns_used"],
                    "remaining_tests": self.max_tests - len(state["tests"]),
                    "edit_mode": "full_or_edits" if small else "edits_only",
-                   "tests": tests, "last_feedback": state["last_feedback"],
-                   "coding_history": session_history(self.directory)}
+                   "tests": tests, "latest_test": latest_test, "last_feedback": feedback,
+                   "read_history": read_history(history), "coding_history": history}
         instruction = INSTRUCTIONS + "\n\n" + r.TOOLBOX_CONTRACT
-        default_images = (r._images(state["last_feedback"].get("results", []))
+        default_images = (r._images(latest_test["results"]) if latest_test else [])
+        default_images = (default_images or r._images(feedback.get("results", []))
                           or r._images(payload["results"])
                           or r._images(self.payload))
         context = ResearchContext(payload, r._images(payload, include_all=True),
             default_image_paths=default_images,
-            pinned_keys=("toolbox",) if small else (), instruction=instruction)
+            pinned_keys=("toolbox",) if source_chars <= MAX_PINNED_CHARS else (), instruction=instruction)
         evidence_dir = self.directory / "evidence.context"
         if (evidence_dir / "manifest.json").exists():
             context.retain_assets(ResearchContext.load(evidence_dir))
@@ -310,7 +394,7 @@ class CodingSession:
             raise ContextError("Edit requires a nonempty hypothesis")
         if "files" in response:
             files = response["files"]
-            if len(dumps(old)) > MAX_PINNED_CHARS:
+            if len(dumps(old)) > MAX_FULL_FILE_CHARS:
                 raise ContextError("This draft requires exact block edits; read source pages first")
             if (not isinstance(files, dict) or set(files) != set(r.CAPABILITY_FILES)
                     or any(not isinstance(value, str) for value in files.values())):
@@ -428,9 +512,10 @@ class CodingSession:
             budget = min(READ_CHARS, MAX_PROMPT_CHARS - len(base) - 3_000)
             replies, images = self.context.read(response.get("evidence_requests"), budget=budget)
             state["read_results"] = replies
-            state["image_ids"] = images or self.context.default_image_ids
+            state["image_ids"] = images or None
             return {"status": "read", "reads": [{key: item[key] for key in
-                    ("id", "offset", "end", "found", "attached") if key in item} for item in replies]}
+                    ("id", "offset", "end", "total_chars", "complete", "page_limited", "found", "attached")
+                    if key in item} for item in replies]}
         state["read_results"], state["image_ids"] = [], None
         if action == "edit":
             return self._edit(response, state, turn)

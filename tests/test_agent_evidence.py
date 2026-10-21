@@ -8,6 +8,7 @@ import pytest
 from PIL import Image
 
 from simex.agent import Agent, AgentError, AgentTransportError, FIXED_MODEL, InvalidPolicy
+from simex.research_context import MAX_PROMPT_CHARS
 from simex import cli, research
 
 
@@ -121,7 +122,7 @@ def test_oversized_research_call_fails_before_launch_or_budget_consumption(monke
     def forbidden_call(*args, **kwargs):
         pytest.fail('Oversized input must not start a model process')
     monkeypatch.setattr('simex.agent.subprocess.run', forbidden_call)
-    for prompt, images in [('x'*64_000, []), ('read', ['image.png']*5)]:
+    for prompt, images in [('x'*MAX_PROMPT_CHARS, []), ('read', ['image.png']*5)]:
         with pytest.raises(AgentError, match='bounded context'):
             agent.ask('repair_select', prompt, images)
     assert agent.count == 0
@@ -287,6 +288,96 @@ def _action(method, before, after, **arguments):
     return {'method': method, 'arguments': arguments, 'before': before, 'after': after}
 
 
+def test_closure_response_exposes_continued_closing_during_the_first_arm_motion():
+    from simex.evidence import action_summary
+    actions = [_action('gripper', _state(1., .02), _state(1.75, .02, .04),
+                       width=0., force=35., duration=.6),
+               _action('move_ee', _state(1.75, .02, .04), _state(2.5, .04, .006))]
+    response = action_summary({'actions': actions})['first_close_response']
+    assert response['requested_duration_s'] == .6
+    assert response['measured_duration_s'] == .75
+    assert response['endpoint_width_m'] == response['next_arm_start_width_m'] == .04
+    assert response['next_arm_delay_s'] == 0.
+    assert response['next_arm_endpoint']['width_m'] == .006
+    assert response['next_arm_endpoint']['tcp_delta_m'] == pytest.approx([0., 0., .02])
+    assert 'holding' not in response and 'contact' not in response
+
+
+def test_closure_response_measures_waiting_but_never_crosses_another_gripper_command():
+    from simex.evidence import action_summary
+    close = _action('gripper', _state(0., .02), _state(.75, .02, .04), width=0.)
+    wait = _action('wait', _state(.75, .02, .04), _state(1., .02, .008))
+    arm = _action('move_joints', _state(1., .02, .008), _state(2., .1, .006))
+    response = action_summary({'actions': [close, wait, arm]})['first_close_response']
+    assert response['next_arm_delay_s'] == .25
+    assert response['next_arm_start_width_m'] == .008
+    assert response['next_arm_endpoint']['method'] == 'move_joints'
+    opening = _action('gripper', _state(1., .02, .008), _state(1.5, .02), width=.08)
+    stopped = action_summary({'actions': [close, wait, opening, arm, close]})['first_close_response']
+    assert stopped['action_index'] == 0
+    assert stopped['next_arm_delay_s'] is stopped['next_arm_endpoint'] is None
+
+
+def test_closure_response_missing_measurements_do_not_imply_settling_or_zero_delay():
+    from simex.evidence import action_summary
+    close = _action('gripper', {'gripper_width': .08},
+                    {'gripper_width': float('nan')}, width=0., force=float('inf'))
+    arm = _action('move_ee', {}, {'gripper_width': .007, 'private_object': 'not public'})
+    response = action_summary({'actions': [close, arm]})['first_close_response']
+    assert response['endpoint_width_m'] is response['next_arm_delay_s'] is None
+    assert response['measured_duration_s'] is response['command_force_n'] is None
+    assert response['next_arm_endpoint']['width_m'] == .007
+    assert response['next_arm_endpoint']['tcp_delta_m'] is None
+    assert 'private_object' not in json.dumps(response, allow_nan=False)
+    assert action_summary({})['first_close_response'] is None
+    assert action_summary({'actions': []})['first_close_response'] is None
+
+
+@pytest.mark.parametrize('final_z,expected_error', [(.052, .008), (.06, 0.)])
+def test_cartesian_tracking_distinguishes_persistent_residual_from_settling(final_z, expected_error):
+    from simex.evidence import action_summary
+    action = _action('move_ee', _state(0, .1), _state(1, .052),
+                     position=[.4, .1, .06])
+    trace = [_state(.5, .09), {**_state(2, final_z),
+             'joint_velocities': [0.] * 7, 'hidden_objects': {'plate': 'private'}}]
+    summary = action_summary({'actions': [action], 'robot_trace': trace})
+    tracking = summary['last_cartesian_command_tracking']
+    assert tracking['reference'] == 'raw_move_ee_command_not_policy_nominal_target'
+    assert tracking['action_endpoint']['position_error_m'] == pytest.approx(.008)
+    assert tracking['last_observed']['position_error_m'] == pytest.approx(expected_error)
+    assert tracking['last_observed']['seconds_after_action_end'] == 1.
+    assert tracking['last_observed']['max_abs_joint_velocity_rad_s'] == 0.
+    assert 'hidden_objects' not in json.dumps(summary)
+    assert 'cause' not in tracking
+
+
+def test_cartesian_tracking_does_not_compare_after_new_joint_command_or_before_endpoint():
+    from simex.evidence import action_summary
+    cartesian = _action('move_ee', _state(0, .1), _state(1, .052),
+                        position=[.4, .1, .06])
+    joint = _action('move_joints', _state(1, .052), _state(2, .2), joints=[0.] * 7)
+    assert action_summary({'actions': [cartesian, joint]})['last_cartesian_command_tracking'] is None
+    tracking = action_summary({'actions': [cartesian]}, states=[_state(.5, .06)])[
+        'last_cartesian_command_tracking']
+    assert tracking['last_observed'] is None
+    # A wait does not replace the held arm target; trace still measures that command.
+    waited = action_summary({'actions': [cartesian, _action('wait', _state(1, .052),
+                              _state(2, .052))]}, states=[_state(2, .052)])
+    assert waited['last_cartesian_command_tracking']['last_observed']['position_error_m'] == pytest.approx(.008)
+
+
+def test_cartesian_tracking_missing_and_invalid_measurements_do_not_invent_evidence():
+    from simex.evidence import action_summary
+    invalid = _action('move_ee', {}, {'ee_position': [0., 0., float('nan')]},
+                      position=[.4, .1, .06])
+    summary = action_summary({'actions': [invalid]}, states=[_state(2, .06)])
+    tracking = summary['last_cartesian_command_tracking']
+    assert tracking['action_endpoint'] is tracking['last_observed'] is None
+    json.dumps(summary, allow_nan=False)
+    invalid['arguments']['position'] = [.4, .1, float('inf')]
+    assert action_summary({'actions': [invalid]})['last_cartesian_command_tracking'] is None
+
+
 def test_action_progress_counts_commands_without_claiming_grasp_or_release():
     from simex.evidence import action_summary
     # A blocked close is still a close command. Later withdrawal must not count
@@ -365,6 +456,39 @@ def test_last_motion_rejection_and_termination_keep_public_provenance():
     assert traceback['termination']['reason'] == 'RuntimeError: no reachable approach'
 
 
+@pytest.mark.parametrize('accepted', [
+    "MOTION {'success': True, 'results': [{'status': 'accepted', "
+    "'termination_reason': 'correction_budget_exhausted'}]}",
+    'MOTION {"status":"accepted","attempts":[{"status":"failed"}]}',
+    "motion {'target': [0., 0., .2], 'success': True, "
+    "'debug': unknown_expression(), 'reason': 'previous tracking failed'}",
+])
+def test_successful_motion_diagnostics_do_not_hide_actual_earlier_failure(accepted):
+    from simex.evidence import action_summary
+    stop = 'STOP contact descent rejected'
+    result = action_summary({'actions': [], 'status': 'failed', 'stdout': stop + '\n' + accepted})
+    assert result['last_motion_rejection']['reason'] == stop
+    assert result['termination']['reason'] == stop
+    only_accepted = action_summary({'actions': [], 'status': 'failed', 'stdout': accepted})
+    assert only_accepted['last_motion_rejection'] is None
+    assert only_accepted['termination']['source'] == 'execution_status'
+
+
+def test_structured_failure_is_retained_and_recovered_error_is_not_success_termination():
+    from simex.evidence import action_summary
+    failed = "MOTION {'success': False, 'target': [0.4, 0.1, 0.2]}"
+    result = action_summary({'actions': [], 'status': 'failed', 'stdout': failed})
+    assert result['last_motion_rejection']['reason'] == failed
+    # The failed attempt stays available, while the final result says it recovered.
+    recovered = action_summary({'actions': [], 'status': 'success', 'stdout': failed})
+    assert recovered['last_motion_rejection']['reason'] == failed
+    assert recovered['termination']['source'] == 'execution_status'
+    assert recovered['termination']['reason'] == 'Policy returned; independent task predicate passed.'
+    explicit = "STOP {'success': True, 'reason': 'motion recovery exhausted'}"
+    assert action_summary({'actions': [], 'status': 'failed', 'stdout': explicit})[
+        'last_motion_rejection']['reason'] == explicit
+
+
 def test_public_evidence_summary_uses_complete_trace_and_refreshes_diagnostic_cache(tmp_path):
     from simex.evidence import summarize_public_evidence
     public = tmp_path / 'public'
@@ -378,9 +502,51 @@ def test_public_evidence_summary_uses_complete_trace_and_refreshes_diagnostic_ca
     first = summarize_public_evidence(evidence, str(tmp_path))
     assert first['action_summary']['tcp_rise_after_close_m'] == pytest.approx(.18)
     assert summarize_public_evidence(evidence, str(tmp_path))['action_summary'] == first['action_summary']
+    cache_path = public / 'research_evidence.json'
+    cached = json.loads(cache_path.read_text())
+    cached['source_metadata']['version'] = 5
+    cached['summary']['action_summary'].pop('first_close_response')
+    cached['summary']['action_summary']['termination']['reason'] = 'stale interpretation'
+    cache_path.write_text(json.dumps(cached))
+    refreshed = summarize_public_evidence(evidence, str(tmp_path))
+    assert refreshed['action_summary']['termination']['reason'] == 'STOP tracking rejected'
+    assert refreshed['action_summary']['first_close_response']['endpoint_width_m'] == .01
     changed = summarize_public_evidence({**evidence, 'stdout': 'STOP exhausted budget'}, str(tmp_path))
     assert changed['action_summary']['termination']['reason'] == 'STOP exhausted budget'
     assert changed['action_summary']['last_motion_rejection'] is None
+
+
+def test_public_rollout_restores_complete_policy_stdout_without_changing_saved_result(tmp_path):
+    import copy
+    from simex.research_context import ResearchContext
+    transcript = "STOP descent tracking failed\n" + "ordinary measurements\n" * 1000
+    transcript += "MOTION {'success': True, 'termination_reason': 'correction_budget_exhausted'}\n"
+    (tmp_path / 'policy_stdout.log').write_text(transcript)
+    result = {'status': 'failed', 'success': False, 'output_dir': str(tmp_path),
+              'public_evidence': {'status': 'failed', 'actions': [], 'stdout': transcript[-16000:]}}
+    original = copy.deepcopy(result)
+    public = research._public(result)
+    assert result == original
+    assert public['evidence']['stdout'] == transcript
+    assert public['evidence']['action_summary']['termination']['reason'] == 'STOP descent tracking failed'
+    context = ResearchContext({'trial': public})
+    ref = context.summary['trial']['evidence']['stdout']['evidence_id']
+    assert context.assets[ref]['text'] == transcript
+    # Infrastructure tracebacks remain excluded even when a complete file exists.
+    interrupted = research._public({**result, 'status': 'interrupted'})
+    assert interrupted['evidence']['stdout'] == ''
+    assert 'STOP descent' not in json.dumps(interrupted)
+
+
+def test_public_stdout_migration_cannot_follow_a_link_outside_the_rollout(tmp_path):
+    run = tmp_path / 'trial'
+    run.mkdir()
+    secret = tmp_path / 'unrelated.txt'
+    secret.write_text('unrelated data')
+    (run / 'policy_stdout.log').symlink_to(secret)
+    public = research._public({'status': 'failed', 'output_dir': str(run),
+                               'public_evidence': {'stdout': 'original public log'}})
+    assert public['evidence']['stdout'] == 'original public log'
 
 
 def test_recorder_retains_only_public_api_diagnostics_and_sanitizes_errors():

@@ -8,7 +8,7 @@ import pytest
 
 from simex import research
 from simex.agent import Agent, AgentBudgetExhausted, AgentResponseError, AgentTransportError
-from simex.coding import CodingSession, session_history
+from simex.coding import CodingSession, read_history, session_history
 from simex.research_context import MAX_PROMPT_CHARS, ResearchContext
 from simex.runner import Runner
 from test_research import FakeAgent, FakeRunner, INITIAL_CODE, SMALL, harness, task
@@ -28,6 +28,22 @@ def decide(payload, accept=True):
 
 
 FINISH = {"action": "finish", "reason": "No further justified changes in this cycle."}
+
+
+def test_read_coverage_tracks_delivered_bytes_duplicates_and_empty_pages():
+    def read(start, end):
+        return {"response": {"action": "read"}, "feedback": {"status": "read",
+            "reads": [{"id": "text_source", "offset": start, "end": end}]}}
+    history = [read(0, 4000), read(4000, 7500), read(0, 5000), read(7500, 7500),
+               {"response_error": {"reason": "interrupted"}, "feedback": {"status": "invalid_response"}}]
+    result = read_history(history)
+    assert result["consecutive_reads"] == result["read_operations"] == 4
+    assert result["recent"] == [{"id": "text_source", "ranges": [[0, 7500]], "requests": 4,
+                                "repeated_reads": 1, "empty_pages": 1, "omitted_ranges": 0}]
+    # A malformed operation cannot crash context construction or erase coverage.
+    assert read_history(history + [{"response": []}]) == result
+    edited = read_history(history + [{"response": {"action": "edit"}}])
+    assert edited["consecutive_reads"] == 0 and edited["recent"] == result["recent"]
 
 
 def make_adapter(monkeypatch, tmp_path):
@@ -155,6 +171,37 @@ def test_edits_after_test_cannot_be_accepted_without_another_test(tmp_path):
     assert state["current_id"] == "initial" and not state["accepted"]
     history = session_history(session.directory)
     assert history[3]["feedback"]["status"] == "operation_error"
+
+
+def test_latest_candidate_evidence_survives_reads_and_subsequent_edits(tmp_path):
+    def check(payload):
+        latest = payload["latest_test"]
+        assert latest["test_id"] == "test_000"
+        assert latest["draft_id"] == "draft_000"
+        assert latest["results"][0]["success"] is True
+        assert latest["baseline_results"][0]["success"] is False
+        assert payload["results"][0]["success"] is False
+        return latest
+
+    def read(payload):
+        check(payload)
+        assert "results" not in payload["last_feedback"]  # no duplicate payload
+        return {"action": "read", "evidence_requests": [
+            {"id": payload["coding_history"]["evidence_id"], "offset": 0, "limit": 100}]}
+
+    def change(payload):
+        check(payload)
+        assert payload["last_feedback"]["status"] == "read"
+        return edit(INITIAL_CODE + "REPAIR = 2\n")
+
+    def finish(payload):
+        assert check(payload)["draft_id"] != payload["working_draft"]
+        return FINISH
+
+    session, _ = build_session(tmp_path, [edit(), {"action": "test"}, read, change, finish])
+    state = session.run()
+    assert state["current_id"] == "initial"
+    assert len(session.runner.calls) == 2  # reading and editing do not rerun trials
 
 
 def test_invalid_operations_and_json_spend_turns_not_tests(tmp_path):
@@ -303,16 +350,39 @@ def test_large_toolbox_requires_edits_and_old_evidence_ids_survive(tmp_path):
         return {"action": "read", "evidence_requests": [{"id": identifier, "offset": 0, "limit": 100}]}
     def apply_edit(payload):
         assert payload["_coding_context"]["read_results"][0]["text"].startswith("Large notes")
+        assert payload["read_history"]["recent"][0]["ranges"] == [[0, 100]]
         return {"action": "edit", "edits": [{"file": "skill.md", "old": "Large notes", "new": "Revised notes"}],
                 "hypothesis": "Clarify the measured behavior"}
     session, _ = build_session(tmp_path, [read_source, apply_edit,
         lambda p: {"action": "read", "evidence_requests": [{"id": previous_id[0], "offset": 0, "limit": 50}]},
-        FINISH], skills="Large notes\n" + "Existing capability documentation.\n" * 1800)
+        FINISH], skills="Large notes\n" + "Existing capability documentation.\n" * 2100)
     state = session.run()
     context = ResearchContext.load(session.directory / "evidence.context")
     assert context.assets[previous_id[0]]["text"].startswith("Large notes")
     assert state["current_id"] == "initial"
     assert session.agent.coding_inputs[-1]["_coding_context"]["read_results"][0]["text"].startswith("Large notes")
+    coverage = session.agent.coding_inputs[-1]["read_history"]
+    assert coverage["consecutive_reads"] == 1
+    assert coverage["recent"][0]["repeated_reads"] == 1
+
+
+def test_medium_library_remains_visible_across_reads_but_requires_exact_edits(tmp_path):
+    code = INITIAL_CODE + "THRESHOLD = 1\n#" + "p" * 40_000 + "\n"
+    def read(payload):
+        assert payload["toolbox"]["toolbox.py"] == code
+        assert payload["edit_mode"] == "edits_only"
+        return {"action": "read", "evidence_requests": [
+            {"id": payload["accepted_toolbox"]["toolbox.py"]["evidence_id"], "limit": 100}]}
+    def revise(payload):
+        assert payload["toolbox"]["toolbox.py"] == code
+        assert payload["toolbox"]["skill.md"] == "Capability usage"
+        return {"action": "edit", "edits": [
+            {"file": "toolbox.py", "old": "THRESHOLD = 1", "new": "THRESHOLD = 2"}],
+            "hypothesis": "Use exact visible source after an evidence read"}
+    session, _ = build_session(tmp_path, [read, revise, FINISH], code=code)
+    state = session.run()
+    assert "THRESHOLD = 2" in Path(state["drafts"][state["draft_id"]]["path"], "toolbox.py").read_text()
+    assert len(session.runner.calls) == 1
 
 
 def test_discover_uses_coding_loop_and_preserves_adapt_and_evaluate(harness):
@@ -505,6 +575,28 @@ def test_cross_cycle_context_exposes_full_operation_history(harness):
     context = ResearchContext.load(run / "discovery/member_00/cycle_01/coding/evidence.context")
     records = json.loads(context.assets[previous["evidence_id"]]["text"])
     assert [item["response"]["action"] for item in records] == ["edit", "test", "decide", "finish"]
+
+
+def test_coding_retains_frozen_peer_ideas_but_not_peer_implementation(harness):
+    runner, _, run = harness
+    actions = []
+    for member in range(2):
+        actions += [edit(INITIAL_CODE + f"REPAIR = 'ONLY_MEMBER_{member}_IMPLEMENTATION'\n"),
+                    {"action": "test"}, decide, FINISH]
+    agent = CodingAgent(actions + [FINISH, FINISH])
+    cfg = {**SMALL, "cycles": 2, "discovery_mode": "interactive",
+           "coding_max_turns": 40, "coding_max_tests": 10}
+    research.discover(runner, agent, run, cfg)
+    for member, payload in enumerate(agent.coding_inputs[-2:]):
+        peers = payload["peer_experiment_summaries"]
+        frozen = research._json(run / f"discovery/member_{member:02d}/cycle_01/peer_summaries.json")
+        assert peers == frozen
+        assert peers[0]["member"] == 1 - member
+        assert [s["cycle"] for s in peers[0]["summaries"]] == [0]
+        assert peers[0]["summaries"][0]["accepted_hypotheses"]
+        assert f"ONLY_MEMBER_{1-member}_IMPLEMENTATION" not in json.dumps(payload)
+        assert f"ONLY_MEMBER_{member}_IMPLEMENTATION" in payload["toolbox"]["toolbox.py"]
+    assert all(p["peer_experiment_summaries"] == [] for p in agent.coding_inputs[:-2])
 
 
 def test_full_coding_history_stays_bounded_and_readable_with_large_evidence(tmp_path):

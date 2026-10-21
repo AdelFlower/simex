@@ -74,6 +74,14 @@ class RuntimeRegressionTests(unittest.TestCase):
         slot = json.loads((self.root / 'target_ledger.json').read_text())['slots']['adapt/far_plate/00']
         return result, slot
 
+    def test_full_policy_stdout_is_retained_for_paged_research(self):
+        self.runner.agent.script = "print('INITIAL_DIAGNOSTIC')\nprint('x' * 20000)\n"
+        result = self.target()
+        stdout = result['public_evidence']['stdout']
+        self.assertTrue(stdout.startswith('INITIAL_DIAGNOSTIC\n'))
+        self.assertEqual(stdout, (self.root / 'trial/policy_stdout.log').read_text())
+        self.assertGreater(len(stdout), 20000)
+
     def test_spawn_failure_is_pending_and_can_resume_once(self):
         with patch('simex.runner.subprocess.Popen', side_effect=OSError('missing bubblewrap')):
             with self.assertRaises(research.ResearchError):
@@ -212,6 +220,26 @@ class RuntimeRegressionTests(unittest.TestCase):
         self.assertEqual(self.worker.motions[0][1]['duration'], 30.)
         self.assertEqual(self.worker.motions[1][1]['duration'], 2.)
 
+    def test_source_arm_settle_counts_toward_time_limit_but_target_ignores_it(self):
+        self.runner.config['max_sim_time'] = .3
+        self.runner.workers['mujoco'] = self.worker
+        script = 'robot.move_joints([0, -.5, 0, -2.2, 0, 1.7, .785398], duration=.2)\n'
+        calibration = {'arm_settle_s': .15, 'gripper_stiffness_scale': .5}
+        source = self.runner.rollout('mujoco', make_task('far_plate', 41), ROOT / 'simex/initial',
+                                     self.root / 'source_settle', script=script,
+                                     source_config=calibration)
+        self.assertEqual(source['status'], 'policy_error')
+        self.assertEqual(self.worker.motions, [])
+        self.assertIn('Simulation time budget exhausted', source['reason'])
+        self.runner.rollout('isaac', make_task('far_plate', 41), ROOT / 'simex/initial',
+                            self.root / 'target_settle', script=script,
+                            source_config=calibration)
+        self.assertEqual(len(self.worker.motions), 1)
+        self.assertEqual(self.worker.motions[0][1]['duration'], .2)
+        scene = json.loads((self.root / 'target_settle/private/scene.json').read_text())
+        self.assertNotIn('arm_settle_s', scene['physics'])
+        self.assertNotIn('gripper_stiffness_scale', scene['physics'])
+
     def test_interrupted_source_cannot_enter_candidate_comparison(self):
         self.runner.workers['mujoco'] = self.worker
         self.worker.failure = InfrastructureError('source renderer failed')
@@ -302,6 +330,47 @@ class WorkerErrorTests(unittest.TestCase):
 
 
 class RecorderEvidenceTests(unittest.TestCase):
+    def test_passive_object_trace_is_private_and_uses_existing_capture_times(self):
+        backend = MagicMock()
+        backend.state.return_value = {'sim_time': 1., 'ee_position': [0., 0., .4]}
+        backend.metrics.return_value = {'objects': {'plate': {'position': [.3, .2, .1]}},
+                                        'contact_parameters': {'secret': 7.4}}
+        backend.observe.return_value = {'rgb': np.zeros((2, 2, 3), dtype=np.uint8)}
+        encoder = MagicMock()
+        encoder.returncode = 0
+        with tempfile.TemporaryDirectory(prefix='simex-object-trace-') as temp:
+            root = Path(temp)
+            with patch('simex.worker.subprocess.Popen', return_value=encoder):
+                recorder = Recorder(backend, root / 'public', root / 'private')
+                recorder.capture()
+                recorder.capture()
+                evidence = recorder.close()
+            rows = [json.loads(line) for line in (root / 'private/object_trace.jsonl').read_text().splitlines()]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['objects']['plate']['position'], [.3, .2, .1])
+            self.assertEqual(rows[0]['robot']['sim_time'], 1.)
+            self.assertEqual(backend.metrics.call_count, 1)
+            self.assertNotIn('contact_parameters', rows[0])
+            self.assertNotIn('objects', json.dumps(evidence))
+            self.assertNotIn('object_trace', json.dumps(evidence))
+            self.assertFalse((root / 'public/object_trace.jsonl').exists())
+            backend.wait.assert_not_called()
+            backend.move_ee.assert_not_called()
+
+    def test_private_sampling_error_does_not_leak_into_policy_feedback(self):
+        backend = MagicMock()
+        backend.state.return_value = {'sim_time': 1.}
+        backend.metrics.side_effect = RuntimeError('private target parameter 7.4')
+        with tempfile.TemporaryDirectory(prefix='simex-object-trace-') as temp:
+            root = Path(temp)
+            recorder = Recorder(backend, root / 'public', root / 'private')
+            recorder.private_sample(backend.state())
+            with patch.object(recorder, 'capture'):
+                evidence = recorder.close()
+            self.assertIn('private target parameter', (root / 'private/object_trace.jsonl').read_text())
+            self.assertEqual(evidence['recording_errors'], [])
+            self.assertNotIn('private target parameter', json.dumps(evidence))
+
     def test_all_actions_and_observations_remain_public(self):
         class Backend:
             time = 0.
