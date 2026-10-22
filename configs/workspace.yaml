@@ -1,0 +1,33 @@
+# Paper-scale learned route. No model budget is inherited or supplied by default.
+protocol: simex_workspace_v1
+route: learned
+model: gpt-6-astra
+cli_version: 0.162.1
+research_image: simex-research:0.162.1
+repetitions: 5
+population: 4
+cycles: 20
+probes: 28
+focused: 10
+replay: 5
+cycle_request_limit: 40
+cycle_test_limit: 10
+adapt_trials: 5
+repairs: 4
+screen_tasks: 5
+align_attempts: 3
+eval_trials: 5
+camera_resolution: [640, 480]
+preparation_reasoning_effort: max
+stage1_reasoning_effort: max
+stage2_reasoning_effort: medium
+evaluation_reasoning_effort: medium
+placement_contract: released_placement_v1
+source_calibration_profile: code_v1
+seed: 20261024
+# Set --model-request-limit and the host gateway URL for an explicitly authorized run.
+# model_gateway_url: https://your-provider.example/v1
+# model_key_env: SIMEX_MODEL_API_KEY
+# observation: /absolute/path/to/public_rgbd.npz
+# workspace_description: /absolute/path/to/workspace.txt
+# source_assets: /absolute/path/to/source/assets

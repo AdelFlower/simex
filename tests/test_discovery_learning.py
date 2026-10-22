@@ -313,7 +313,7 @@ def test_focused_baseline_and_accepted_version_keep_success_origins(harness, mon
     original = runner.rollout
     def rollout(**kwargs):
         result = original(**kwargs)
-        parts = kwargs['out'].parts
+        parts = kwargs['out'].relative_to(run).parts
         passed = 'before' in parts or 'tests' in parts
         result.update(success=passed, status='success' if passed else 'failed')
         return result

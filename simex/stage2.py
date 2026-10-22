@@ -148,6 +148,9 @@ def seal_rollout(out):
     names = ('research_request.json', 'runner_request.json', 'policy.py', 'policy_generation.json',
              'result.json', 'execution.json', 'public_evidence.json', 'policy_stdout.log',
              'private/scene.json', 'private/metrics.json', 'private/object_trace.jsonl')
+    if (out / 'operation_input.json').exists():
+        names += ('operation_input.json', 'unverified_result.json', 'executed_library/toolbox.py',
+                  'executed_library/skill.md', 'executed_library/frozen.json')
     paths = [out / name for name in names if (out / name).is_file()]
     paths += [p for p in (out / 'public').rglob('*') if p.is_file()]
     r._save(out / 'integrity.json', {str(p.relative_to(out)): hashlib.sha256(p.read_bytes()).hexdigest()
@@ -333,6 +336,15 @@ def _screen_and_select(runner, agent, directory, cfg, task_id, task, library, mo
          'source_task': task, 'generalization_tasks': tasks,
          'toolboxes': {k: r._contents(v) for k, v in candidates.items()}})
     chosen = selection.get('selected')
+    if cfg.get('protocol') == 'simex_workspace_v1':
+        if chosen not in candidates or not isinstance(selection.get('reason'), str) or not selection['reason'].strip():
+            raise ResearchError('Selection requires a tested candidate and an explicit agent rationale')
+        selected_evidence = evidence[chosen]
+        # A batch that only produced invalid policies is not a physical test of
+        # a new library. Retaining the already accepted parent is always allowed.
+        if chosen != 'current' and not any(x and x['status'] not in ('invalid_policy', 'generation_error', 'invalid_source_model')
+                for x in [selected_evidence['fixed_replay'], *selected_evidence['generalization']]):
+            raise ResearchError('Untested candidate cannot become the frozen capability')
     if chosen not in candidates:
         selection = {**selection, 'requested': chosen, 'selected': 'current',
                      'validation_error': 'Unknown or invalid candidate; retained current'}
@@ -343,12 +355,20 @@ def _screen_and_select(runner, agent, directory, cfg, task_id, task, library, mo
 def adapt(runner, agent, run, config):
     run = Path(run).resolve()
     with r._lock(run):
-        cfg = initialize(run, config)
-        check = r._json(run / 'source_validation.json', {})
-        if not check.get('passed') or check.get('toolbox_sha256') != r.toolbox_hash(run / 'frozen/supplied'):
-            raise ResearchError('All supplied-skill source acceptance cases must pass first')
+        workspace = config.get('protocol') == 'simex_workspace_v1'
+        cfg = r._json(run / 'manifest.json')['config'] if workspace else initialize(run, config)
+        initial_library = run / ('frozen/stage1' if workspace and cfg['route'] == 'learned' else 'frozen/supplied')
+        if workspace and cfg['route'] == 'learned':
+            if not r._json(run / 'discovery.json'):
+                raise ResearchError('Freeze and select all Stage1 members before adaptation')
+        else:
+            check = r._json(run / 'source_validation.json', {})
+            if not check.get('passed') or check.get('toolbox_sha256') != r.toolbox_hash(initial_library):
+                raise ResearchError('All supplied-skill source acceptance cases must pass first')
         if callable(getattr(agent, 'set_phase', None)):
             agent.set_phase('stage2')
+        if workspace:
+            runner.agent.set_phase('stage2')
         done = r._json(run / 'adaptation.json')
         if done:
             for task in r.TASK_IDS:
@@ -357,20 +377,27 @@ def adapt(runner, agent, run, config):
             return done
         outcomes = {}
         for task_index, task_id in enumerate(r.TASK_IDS):
-            library = run / 'frozen/supplied'
+            library = initial_library
             model = run / 'source_models/initial'
             history = []
             for trial in range(cfg['adapt_trials']):
                 directory = run / 'adaptation' / task_id / f'trial_{trial:02d}'
                 check_library(library)
                 r._freeze(library, directory / 'executed_toolbox')
+                if workspace:
+                    runner.target_source_context = model
                 r._progress(run, 'adaptation_trial_started', task=task_id, trial=trial+1)
                 target = r._target(runner, run, f'adapt/{task_id}/{trial:02d}', library, directory / 'target')
                 script = r._executed_script(target)
                 task = r._json(directory / 'source_reconstruction.json')
                 if task is None:
-                    task = camera_task(with_placement_contract(r._source_reconstruction(
-                        task_id, r._public(target)['evidence']), cfg['placement_contract']), cfg)
+                    if workspace:
+                        from .lab.preparation import reconstruction
+                        task, assumptions = reconstruction(task_id, r._public(target)['evidence'].get('initial_visual_estimates', {}))
+                        r._save(directory / 'reconstruction_provenance.json', assumptions)
+                    else:
+                        task = camera_task(with_placement_contract(r._source_reconstruction(
+                            task_id, r._public(target)['evidence']), cfg['placement_contract']), cfg)
                     r._save(directory / 'source_reconstruction.json', task)
                 initial_hash, model_before = r.toolbox_hash(library), model_hash(model)
                 source = None
@@ -414,17 +441,27 @@ def adapt(runner, agent, run, config):
 def evaluate(runner, agent, run, config):
     run = Path(run).resolve()
     with r._lock(run):
-        cfg = initialize(run, config)
+        workspace = config.get('protocol') == 'simex_workspace_v1'
+        manifest = r._json(run / 'manifest.json') if workspace else None
+        cfg = manifest['config'] if workspace else initialize(run, config)
         if not r._json(run / 'adaptation.json'):
             raise ResearchError('Finish all adaptation before frozen evaluation')
         if callable(getattr(agent, 'set_phase', None)):
             agent.set_phase('evaluation')
+        if workspace:
+            runner.agent.set_phase('evaluation')
         records = []
         for task in r.TASK_IDS:
             for trial in range(cfg['eval_trials']):
-                for method in METHODS:
-                    library = run / ('frozen/supplied' if method == 'skill_transfer' else f'frozen/adapted/{task}')
+                for method in manifest['methods'] if workspace else METHODS:
+                    libraries = {'direct_cap': 'frozen/initial', 'stage1_transfer': 'frozen/stage1',
+                                 'skill_transfer': 'frozen/supplied', 'simex': f'frozen/adapted/{task}',
+                                 'skill_stage2': f'frozen/adapted/{task}'}
+                    library = run / libraries[method]
                     check_library(library)
+                    if workspace:
+                        runner.target_source_context = run / ('source_models/adapted/' + task
+                            if method in ('simex', 'skill_stage2') else 'source_models/initial')
                     result = r._target(runner, run, f'evaluate/{method}/{task}/{trial:02d}', library,
                         run / 'evaluation' / method / task / f'trial_{trial:02d}')
                     records.append({'method': method, 'task_id': task, 'trial': trial,

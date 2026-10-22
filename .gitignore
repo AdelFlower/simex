@@ -31,3 +31,4 @@ direct_plate/
 !simex/skills/direct_plate/*.py
 !simex/skills/direct_plate/*.md
 !simex/skills/direct_plate/*.json
+ref

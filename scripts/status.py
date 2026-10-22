@@ -11,6 +11,12 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--run', type=Path, default=Path('runs/small_v6'))
 args = parser.parse_args()
 root = args.run
+if (root / 'manifest.json').exists() and json.loads((root / 'manifest.json').read_text()).get('protocol') == 'simex_workspace_v1':
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from simex.lab.reporting import status
+    print(json.dumps(status(root), ensure_ascii=False, indent=2))
+    raise SystemExit(0)
 progress = root / 'progress.jsonl'
 events = progress.read_text().splitlines() if progress.exists() else []
 calls = list((root / 'agent_calls').glob('*/request.json'))

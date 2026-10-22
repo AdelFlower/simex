@@ -19,7 +19,7 @@ simex = "simex.cli:main"
 include = ["simex*", "simex_private*"]
 
 [tool.setuptools.package-data]
-simex = ["initial/*.md", "skills/direct_plate/*.md", "skills/direct_plate/*.json"]
+simex = ["initial/*.md", "skills/direct_plate/*.md", "skills/direct_plate/*.json", "lab/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

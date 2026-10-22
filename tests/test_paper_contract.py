@@ -52,9 +52,10 @@ def test_fifth_repair_is_frozen_without_sixth_target_and_evaluation_has_no_feedb
     assert len(evaluation) == 45
     assert all(call["generated"] for call in evaluation)
     for call in evaluation:
-        if "/simex/" in str(call["out"]):
+        method = call["out"].relative_to(run / "evaluation").parts[0]
+        if method == "simex":
             assert "TRIAL_REPAIR = 4" in call["toolbox"]
-        elif "/stage1_transfer/" in str(call["out"]):
+        elif method == "stage1_transfer":
             assert call["toolbox"] == STAGE1_CODE
         else:
             assert call["toolbox"] == INITIAL_CODE

@@ -64,7 +64,8 @@ class Worker:
                 args['usd_path'] = config.get('isaac_asset', '/home/kemove/DexGarmentLab/Assets/Robots/franka/franka.usd')
             elif config.get('source_model'):
                 args.update(source_model=config['source_model'], max_sim_time=config.get('max_sim_time', 120))
-            self.call('initialize', args, timeout=600)
+            initialized = self.call('initialize', args, timeout=600)
+            self.engine_version = initialized.get('version', 'unreported') if isinstance(initialized, dict) else 'unreported'
         except BaseException:
             # A partially constructed Worker is never registered with Runner.
             try:
@@ -204,7 +205,7 @@ class Runner:
         out = Path(out).resolve()
         out.mkdir(parents=True, exist_ok=True)
         path = out / 'policy_generation.json'
-        strict = self.config.get('protocol') == 'supplied_skill_stage2_v1'
+        strict = self.config.get('protocol') in ('supplied_skill_stage2_v1', 'simex_workspace_v1')
         if path.exists() and not strict:
             return json.loads(path.read_text())
         settings = getattr(self.agent, 'generation_settings', None)
@@ -228,6 +229,8 @@ class Runner:
         except (InvalidPolicy, SyntaxError, ValueError) as exc:
             result = dict(status='invalid_policy', reason=str(exc), signature=signature)
         except AgentError as exc:
+            if self.config.get('protocol') == 'simex_workspace_v1' and getattr(exc, 'retryable', False):
+                raise
             result = dict(status='generation_error', reason=str(exc), signature=signature)
         atomic_json(path, result)
         return result
@@ -239,7 +242,7 @@ class Runner:
                 raise ValueError('Code models are source-only and cannot mix with scalar calibration')
             check_model(source_model)
         out.mkdir(parents=True, exist_ok=True)
-        if source_model is not None or self.config.get('protocol') == 'supplied_skill_stage2_v1':
+        if source_model is not None or self.config.get('protocol') in ('supplied_skill_stage2_v1', 'simex_workspace_v1'):
             request = {'engine': engine, 'task': task, 'toolbox_sha256': toolbox_hash(toolbox),
                        'script': script, 'source_model_sha256': model_hash(source_model) if source_model else None,
                        'source_config': source_config or {}}
@@ -454,6 +457,7 @@ class Runner:
                       script_path=str(out / 'policy.py') if (out / 'policy.py').exists() else None,
                       public_evidence=evidence, output_dir=str(out), elapsed=time.monotonic()-started,
                       toolbox_hash=toolbox_hash(toolbox))
+        result['engine_version'] = getattr(worker, 'engine_version', 'unreported')
         if status in ('infrastructure_error', 'interrupted'):
             result['failure_kind'] = 'infrastructure'
         if (out / 'policy.py').exists():

@@ -1,670 +1,105 @@
-# SimEX 本地方法复现
+# SimEX：Panda / MuJoCo → Isaac Sim 复现框架
 
-这是根据随附论文实现的 **Franka 单臂、MuJoCo → Isaac Sim 方法研究**。每次正式任务由模型生成新 Python 策略。原 `discover/adapt/evaluate/run` 流程从基础工具开始；新增 `stage2` 流程明确导入人工提供的 `direct_plate`，只验证 Stage2，不把工程技能计为自主 Stage1 发现。
+新协议 `simex_workspace_v1` 覆盖 **Preparation → Stage1 能力发现 → Stage2 源模型代码校准与修复 → 冻结评估 → 报告**。
+借鉴 EmbodiedEvo 的研究会话、工作区、经验记录、执行留档与恢复机制，保持 SimEX 的单轮无工具执行策略边界。
 
-## 预置 direct_plate 的 Stage2 协议
+当前改造只做离线验收。模拟服务结果、人工 `direct_plate` 回归不能作为自主 Stage1 学习或 Stage2 迁移成功。
+本次[离线验收记录](docs/offline-acceptance-workspace-v1.md)：631 项测试通过，人工技能 MuJoCo 八场景 8/8，真实模型请求与 Isaac 目标执行均为 0。
+旧运行保持独立；历史说明见 [历史 README](docs/history/README-before-workspace-v1.md)。
+方法与差异见 [协议说明](docs/workspace-protocol.md)。
 
-配置为 [configs/direct_plate_stage2.yaml](configs/direct_plate_stage2.yaml)，实现为
-[simex/stage2.py](simex/stage2.py)。三个任务各五次适应，随后 `skill_transfer` 和
-`skill_stage2` 各五次冻结评估，总计 **45 个目标槽位**；评估场景配对，策略逐次重新生成。
-独立 GPT-6 Astra / medium / 2000 次调用预算，不继承旧运行。模型读取证据也计入调用上限，
-因此上限耗尽可能留下未完成槽位；不会隐式增加预算或补跑中断执行。
+## 环境与离线验收
 
-能力库位于 [simex/skills/direct_plate](simex/skills/direct_plate)，包含可独立加载的
-`toolbox.py`、`skill.md`、原始 `source_motion.py` 和哈希来源记录。四个接口为
-`estimate_tote()`、`grasp_plate()`、`place_plate(tote)`、`pick_place_plate()`。
-保留原感知、接近、夹取、保持、运输、释放、撤手参数及 640×480 输入；组合接口先定位箱子。
-演示外层的真值放行分支没有进入封装，策略只访问 RGBD 和 RobotAPI。返回值与阶段日志
-表示执行进度，任务成功由受信评分器判定。
-
-下面的命令**仅运行源域接入验收**，不调用模型、不启动 Isaac、不占用目标槽位：
+沿用仓库 `.venv`、Panda 源资产、MuJoCo 3.3.7 和已安装的 Isaac Sim。研究容器不包含模拟器、目标代码或凭据。
+固定 CLI 版本来自 `.tools/package-lock.json`，不是系统全局 `codex`。
 
 ```bash
-.venv/bin/simex stage2 --source-only \
-  --config configs/direct_plate_stage2.yaml --run runs/validation_direct_plate_stage2_20261021_verified
+cd .tools
+npm ci
+cd ..
+.venv/bin/python scripts/build_research_image.py
+.venv/bin/python scripts/accept_workspace.py --out runs/workspace_acceptance_NEW
 ```
 
-验收使用默认 `far_plate/42` 和原七个回归场景（`far_plate/9..13`、`far_to_near/42`、
-`shifted_single/42`），固定脚本调用 `tb.pick_place_plate()`，必须全部通过
-`released_placement_v1` 才允许适应。它验证预置技能接入，不是学习成绩或未见场景成功率。
+验收脚本运行完整 pytest、真实 CLI 加模拟模型服务、故障注入，以及真实 MuJoCo 的
+`direct_plate` 八场景释放放置回归。脚本禁止真实模型提供方和 Isaac 工作进程启动。
+结果保存到指定的新目录；`acceptance.json` 明列真实模型请求和 Isaac 目标执行计数。
+测试轨迹与单次执行视频保留在该目录内，不能并入正式学习统计。
 
-正式实验入口如下；本次实现交付不执行此命令：
+单独检查代码：`.venv/bin/python -m pytest -q`。
+
+## 新自主实验的启动配置
+
+默认 [configs/workspace.yaml](configs/workspace.yaml)：4 个成员、每成员 20 周期，
+每周期 28 探测、10 聚焦、5 回放场景。Stage2 每任务 5 轮、4 候选、5 个共享源场景。
+三个任务、三种方法、5 次独立重复，共 300 个目标槽位。
+
+必须准备以下输入，程序不会默认将缺失观测当作准确重建：
+
+- 冻结的公开 RGBD NPZ，字段 `rgb`、`depth`、`intrinsics`、`camera_to_world`，640×480；禁止 pickle。
+- 工作区文字说明和允许使用的源资产目录。
+- 宿主模型服务的 Responses 地址 `model_gateway_url`，以及环境变量 `SIMEX_MODEL_API_KEY`。
+- **显式 `model_request_limit` 或 `--model-request-limit`**。没有默认预算，不继承旧实验额度。
+
+在新配置副本中填入这些字段。以下命令是后续正式实验入口，本次交付不执行它们：
 
 ```bash
-.venv/bin/simex stage2 --config configs/direct_plate_stage2.yaml \
-  --run runs/direct_plate_stage2_20261023
+.venv/bin/python -m simex prepare --config configs/my_workspace.yaml --run runs/my_new_study --model-request-limit 60000
+.venv/bin/python -m simex discover --config configs/my_workspace.yaml --run runs/my_new_study --model-request-limit 60000
+.venv/bin/python -m simex adapt --config configs/my_workspace.yaml --run runs/my_new_study --model-request-limit 60000
+.venv/bin/python -m simex evaluate --config configs/my_workspace.yaml --run runs/my_new_study --model-request-limit 60000
 ```
 
-入口顺序为导入冻结 → 八场景源域验收 → 每任务五轮适应 → 两方法冻结评估 → 报告。
-同一命令恢复既有目录时核对配置、实现、能力库、模型、脚本、结果和录像哈希；输入变更
-需要新目录。开始执行但没有持久结果的槽位保持未完成，拒绝自动重跑。没有额外 Isaac
-冒烟试验，也不会在第五轮修复后追加适应。旧研究目录保持停止，旧报告格式仍可读取。
+数字 `60000` 只是显式配置示例，不是完成论文规模的保证；实际请求达到上限即停。
+也可用 `run` 串行完成所有阶段和重复。冻结后配置、实现、输入或资产改变，都必须开新目录。
+真实目标执行始终由 Isaac Sim 完成；源模型校准与候选筛选始终在 MuJoCo 完成。
 
-每轮固定实际目标脚本和当时能力库，先通过三个源码扩展点校准源模型：
-`build_xml(scene, baseline_xml)`、`command_duration(command)`、
-`control_step(command, robot_state, elapsed, dt, nominal_ctrl)`。
-允许数值接触几何、质量惯量、摩擦、相机、执行器及控制时序修改；XML 元素拓扑、名称、
-资产、碰撞开关、约束和重力保持固定。控制输出是八维有限电机目标且受执行器范围限制。
-隔离子进程只收到 JSON 数据和模型代码，不能访问仓库、目标实现、其他运行、凭据或网络；
-物理步进、状态采集和评分始终由受信 MuJoCo 工作进程负责。改变几何时，评分使用编译后
-的实际碰撞几何边界。这个有边界的代码接口不等于可任意重写模拟器。
+## 人工能力诊断入口
 
-每轮最多三次模型代码修改；初始回放和每次有效修改后的回放都评估，最后一次也不跳过。
-无效模型记录错误并保留最近有效版本。确认对齐必须提供对应阶段的目标/源观测依据，
-“两边都失败”不能单独确认。然后固定源模型，提出四个独立能力修复假设，当前库与有效
-候选均做一次固定脚本回放和五个共享源场景测试，由代理解释并选择，未对齐时说明证据局限。
-模型与能力分别版本化；跨任务重置，第五轮修复进入冻结评估。历史详单可按证据 ID 分页读取。
-
-`report.md/json`、`target_executions.csv` 分别记录验收、流程完成、完整任务成功和
-相对基线改善，附视频、公开阶段、评分细项、代码差异及版本哈希。阶段日志不证明全程持物。
-全部槽位完成不代表复现成功；基线全成功时报告没有测出增益的空间，不临时增加难度。
+[configs/workspace_supplied.yaml](configs/workspace_supplied.yaml) 只比较 `skill_transfer`、
+`skill_stage2`，一次独立运行 45 个目标槽位。它明确使用人工能力，不验证 Stage1 自主发现。
 
 ```bash
-.venv/bin/python -m pytest -q
-.venv/bin/python scripts/verify_run.py --run runs/validation_direct_plate_stage2_20261021_verified
-.venv/bin/python scripts/status.py --run runs/validation_direct_plate_stage2_20261021_verified
+# 只做 MuJoCo 八场景接入验收；没有模型请求和目标执行。
+.venv/bin/python -m simex stage2 --config configs/workspace_supplied.yaml --run runs/my_supplied_check --source-only
 ```
 
-本次工程验收：全量 **597 项测试通过**，最终冻结实现的八个源场景 **8/8** 通过完整释放放置。
-七个原始控制函数的语法树一致；保持、运输、释放、撤手阶段记录及评分细项已检查。
-见 [验收报告与视频](runs/validation_direct_plate_stage2_20261021_verified/report.md) 和
-[检查明细](runs/validation_direct_plate_stage2_20261021_verified/audits/acceptance.json)。
-开发期间前两批源域验证均保留，最终报告只统计本目录的八次验收。
-**正式目标执行 0/45，模型调用 0；不据此宣称 Stage2 迁移成功或适应改善。**
-仅源域验收的 `verify_run.py` 会返回 `integrity_ok=true, complete=false`，退出码为 2；
-这是目标阶段尚未启动的预期状态。
+两条入口共享 Stage2 的代码模型校准、固定脚本回放、四假设筛选和冻结评估。
+源模型提供 XML、命令时长、逐步控制三个扩展点；真实物理步进、观测、RobotAPI 和评分由宿主管理。
+后续正式运行需另建目录，配置模型服务并显式设定请求上限。
 
-## 2026-10-21 新一轮独立实验
-
-`runs/reproduction_actuator_v1_20261021` 已从原始基础库启动，源域预检和模型连通检查通过，
-随后已按用户要求停止，未恢复运行。初始库哈希与原始基础库一致，没有继承旧能力库；实际首个探索请求已
-包含完整释放放置参考和可选的持续抬升判据，见 `audits/startup.json`。
-这只是启动与输入检查，尚不能证明学到抓盘放置能力或完成迁移。
-
-本轮使用 `configs/reproduction_actuator_v1.yaml`：两个成员各探索六周期，Stage2 使用
-`actuator_v1` 源域校准，随后执行独立冻结评估。新一轮单独限额为 2000 次模型调用，
-不与已结束的旧试验合并成绩。启动前代码归档、测试记录和先决条件检查位于本轮目录的
-`source_snapshot.tar.gz`、`prelaunch_checks/` 和 `launch_preconditions.json`。
+## 状态、审计与恢复
 
 ```bash
-python3 scripts/status.py --run runs/reproduction_actuator_v1_20261021
-python3 scripts/verify_run.py --run runs/reproduction_actuator_v1_20261021
+.venv/bin/python -m simex status --run runs/my_new_study
+.venv/bin/python -m simex verify --run runs/my_new_study
+.venv/bin/python -m simex report --run runs/my_new_study
+.venv/bin/python -m simex stop --run runs/my_new_study
+.venv/bin/python -m simex resume --run runs/my_new_study
 ```
 
-以下保留旧实验的失败结果和当时修改的依据；该旧版本的测试记录为 572 项通过。
+`status`、`verify` 可读旧记录；旧格式的详细审计仍可使用 `scripts/verify_run.py`。
+`scripts/status.py` 和 `scripts/verify_run.py` 也是新协议的兼容入口。
+`resume` 只支持新协议，先核对冻结哈希与执行台账，不接受已开始但结果丢失的自动重跑。
 
-## 2026-10-21 释放判定修正版
+研究工作区只读规则和公开证据，可写笔记与当前阶段草稿。持久研究代理通过
+`status / submit / test / commit / finish` 操作；未测试草稿不能成为最终能力。
+每个实际推理请求单独计数，包括会话内部请求、压缩和重试。执行策略生成器始终是新的单轮文本请求。
 
-原实验的几何入箱判据存在缺陷：仍夹着盘子也能通过。冻结选拔中，两个成员的原评分
-分别为 7/9、4/9，实际完整释放分别为 1/9、3/9；辅助任务分别为 2/4、3/4。
-这一差异会影响成员选择和 Stage 2 修复反馈，因此原服务已停止。停止时首个目标槽位
-仅被预留，没有目标策略进入物理执行；全部原始代码、结果、视频和评分保留。
+报告自动刷新并区分：预置技能源域验证、Stage1 流程与子能力证据、完整源任务成功、
+Stage2 流程完成、目标成功和相对基线改善。每条执行记录关联视频、实际策略、能力版本、
+源模型版本、引擎版本和 `released_placement_v1` 评分版本。
 
-`configs/reproduction_release.yaml` 使用 `released_placement_v1`：保留抬升、完整入箱、
-红盘留外要求，并要求实际闭合后开爪至少 6 cm、开爪后撤手至少 5 cm、TCP 与盘心
-距离至少为盘子半径加 5 cm。最后半秒至少三个有效采样须持续入箱、张爪、分离，
-速度低于 0.05 m/s、位置漂移不超过 5 mm；已有指端接触测量为接触时直接判失败。
-缺失测量不能成为成功。判据阈值随运行清单冻结，不增加物理步数，也不向模型暴露真值。
+## 主要实现
 
-修正版继承原实验学到的工具库，对全部既有源选拔轨迹重新评分，选择成员 1；
-不重新训练、生成或执行这些源策略，也不注入人工抓盘脚本。原课程仍按原有子任务
-判据训练，这一限制记录在继承文件中。两次运行共享原来的 2000 次模型调用上限：
-原运行已收费 480 次，包括未执行的目标策略请求，修正版剩余 1520 次。
-目标场景种子与 15 次适应、45 次冻结评估预算保持一致，三种方法使用相同的新判据。
-修正版及后续扩展最近一次完整测试为 572 项通过；此前的校准参数说明维护另通过 71 项研究流程回归。
-校准代码证据补全通过 106 项研究流程与上下文回归，真实记录的完整工具库分页读取也已验证。
-只读分析阶段的完整代码常驻修正另通过 114 项研究流程与上下文回归。
-闭合动作诊断补全另通过 161 项相关回归和真实记录的上下文容量演练。
-此前的 12 项 CLI 补充检查及真实 MuJoCo 正反例回放也已通过：
-释放撤手的策略通过，仍夹着盘子的策略被拒绝。继承审计通过，两引擎预检通过，
-目标域适应已完成，但 15 次目标试验均未完成完整任务。对应的 50 次源域校准回放、
-180 次源域筛选均已完成；4 轮由代理确认了观察到的失败行为对齐，11 轮仍未确认。
-15 组当前库固定回放的物体轨迹均与对应最终校准回放逐字节一致。45 次独立冻结评估
-现已全部完成，三种方法均为 0/15，各任务均为 0/5；本轮未验证目标域完整放置能力。
-60 个目标槽位完整性检查通过，原运行与修正版累计使用 1141/2000 次模型调用，
-失败和已收费的中断调用均保留，没有扩展原实验限额。
-适应与最终评估审计分别见 `runs/reproduction_release_20261021/audits/adaptation_complete.json`
-和 `runs/reproduction_release_20261021/audits/evaluation_complete.json`。
-
-冻结评估期间的静态复核发现一处校准提示错误：统一时长系数实际只缩放移动与夹爪命令，
-不缩放 `wait`。后续使用的说明已修正，115 项研究流程与上下文回归通过；既有适应记录
-仍保留原提示与实际执行结果，不重算或重跑。本轮冻结配置仅开放质量、摩擦、相机偏移和
-动作时长，较论文允许修改模拟器的范围更窄，尚不能单独调整夹爪响应或接触几何。
-该限制及提示修正见 `audits/calibration_scope_review.json`；它们不是已证实的失败原因。
-
-后续新实验可在配置中设置 `source_calibration_profile: actuator_v1`，让校准代理根据
-公开的固定策略回放证据，额外调整以下源域控制参数。默认仍为 `basic`，运行开始后不能
-切换配置；已归档的 `reproduction_release_20261021` 保持 `basic`，未启用这些新参数。
-
-| 参数 | 范围 / 默认值 | 作用 |
-| --- | --- | --- |
-| `arm_settle_s` | 0–0.5 秒 / 0 | 移动轨迹结束后保持最终关节目标，再返回状态；不延长轨迹插值，不影响夹爪或显式等待 |
-| `gripper_stiffness_scale` | 0.25–1 / 1 | 缩放源夹爪位置伺服刚度，保留目标开度、线性目标插值和每指力上限 |
-| `gripper_damping_scale` | 1–4 / 1 | 独立缩放源夹爪速度阻尼，保留命令时长和机械臂增益 |
-
-新增的停稳时间计入源域仿真时长预算；任务生成器和目标域不能使用这些源域模型字段。
-默认控制序列的逐步状态已与修改前比较，264 步全部逐值一致。九组夹爪增益组合通过
-实际 MuJoCo 自由开合检查，但此检查不证明接触模型对齐或抓取能力。更快的目标跳变及
-扩大刚度范围曾产生明显关节越界，未纳入本版。新配置尚未用于正式 Stage 2 实验。
-完整测试日志和物理接口验证分别见
-`runs/validation_release_contract/actuator_calibration_full_pytest.log`、
-`runs/validation_release_contract/actuator_calibration_validation.json`。
-
-后续 Stage1 的探测、聚焦和编码上下文现在会收到本轮完整释放放置的判据参考。
-`inside` 仅代表几何入箱；声称完成释放放置的任务须包含 `released`。代理仍可自行生成
-抬升、移位等子任务及其判据，子任务成功仅按声明的范围解释；本轮已经完成的训练不改写。
-这项修正通过 178 项相关回归，见 `runs/validation_release_contract/discovery_placement_context_pytest.log`。
-
-源域任务还可选择 `{"kind":"sustained_lift","object":"green","min":0.05,"seconds":1.0}`：
-检查对象相对初始高度在最后指定时间窗的所有采样及实际末态都至少抬升指定距离。
-时间窗允许 0.5–5 秒，须有覆盖起点的采样、至少三个测量点，采样间隔不得超过 0.30 秒；
-缺失、乱序、过期或不完整的轨迹不能通过。这是持续采样高度，不是接触夹持证明，也不限制
-水平搬运；用于需要以抬起状态结束的子任务，不要求已经放下的完整任务仍悬空。
-原 `lift` 的历史最高高度语义和已有成绩保持不变。仅用既有源轨迹的正反例检查见
-`runs/validation_release_contract/sustained_lift_saved_trace_validation.json`，未重新执行仿真。
-该扩展的完整测试日志为 `runs/validation_release_contract/sustained_lift_full_pytest.log`。
-
-新一轮独立配置为 `configs/reproduction_actuator_v1.yaml`：从原始运动与感知库开始，
-两个成员各探索六周期，训练和选拔从开始就获得完整任务的释放判据说明；Stage2 启用
-上述可选源域控制校准，任务生成器可自行选择持续高度等子任务判据。三任务各五次适应、
-三方法各五次冻结评估保持不变，使用新种子。
-新一轮单独限额为 2000 次模型调用，不扩大原实验的限额，也不合并两轮成绩。
-该轮已在既有冻结评估全部完成、旧服务退出后启动，源域预检已通过，正在执行 Stage1；
-旧试验的失败记录和冻结能力库完整保留。多项修改一同启用，本轮不构成单因素消融实验。
-
-```bash
-# 本轮已完成，以下命令检查归档记录。
-python3 scripts/status.py --run runs/reproduction_release_20261021
-python3 scripts/verify_run.py --run runs/reproduction_release_20261021
-.venv/bin/simex report --run runs/reproduction_release_20261021
-```
-
-继承流程会核对完整源选拔集、原工具库、未使用目标反馈以及剩余模型预算。
-`stage1_import.json` 记录来源和重评规则，`private/source_selection_regrade.json` 保存重评证据；
-旧记录仍位于 `runs/reproduction_20261020`。不能把旧评分和新评分混合计算成功率。
-
-结果图可用以下命令生成（绘图环境需要 Matplotlib；本机系统 `python3` 已具备）：
-
-```bash
-.venv/bin/simex report --run runs/reproduction_release_20261021
-python3 scripts/plot_results.py --run runs/reproduction_release_20261021
-```
-
-`figures/results.png` 与 `results.svg` 分开展示冻结源选拔、三个任务的目标适应轨迹、
-三种方法的冻结目标评估；`results.csv` 导出源选拔和冻结评估计数。未完成的评估格
-不显示成功率，适应格表示该轮修复前的目标结果。图只读取已有记录，不参与模型筛选。
-
-固定脚本校准的盘子高度与夹爪开度曲线可独立导出；`--trial` 从 0 开始：
-
-```bash
-python3 scripts/plot_alignment.py --run runs/reproduction_release_20261021 --task far_to_near --trial 2
-```
-
-该命令只读取已完成回放的私有诊断，核对脚本一致性，生成 PNG、SVG、CSV 与来源哈希记录。
-夹爪曲线用圆点标出公开动作记录中的闭爪结束开度，随后连接定时轨迹采样，避免遗漏闭爪后
-的快速变化；精确事件另存为 `_closing_events.csv`，原轨迹 CSV 保持不变。开度本身不证明夹持。
-夹爪曲线从首次闭爪结束画到下一次张爪开始；开度不能单独证明接触。
-图中明确保留未确认的对齐状态。这些材料用于操作者审查，不会进入研究代理上下文或重新执行仿真。
-
-## 2026-10-20 原始实验与保留记录
-
-本轮使用独立配置 `configs/reproduction.yaml` 和目录 `runs/reproduction_20261020`，
-执行 Stage 1 → Stage 2 → 冻结评估。旧运行保留，不向新成员注入旧成功脚本。
-初始配置为两个成员、每成员三周期，采用交互式编码优化；每周期最多 40 次交互和
-10 批测试。目标适应为三个任务各五次；三种方法各执行三个任务、每任务五次评估，
-合计 60 个正式目标试验。只有完成的真实 rollout 才能证明能力，启动服务和通过预检
-不代表复现成功。
-
-```bash
-# 原实验已停止；以下命令只检查保留记录，不恢复旧评分下的目标适应。
-python3 scripts/status.py --run runs/reproduction_20261020
-python3 scripts/verify_run.py --run runs/reproduction_20261020
-.venv/bin/simex report --run runs/reproduction_20261020
-```
-
-两引擎的 RGBD、物理动作、主动观察、隔离和录像预检，以及 GPT-6 Astra 连通检查均已通过，
-见运行目录的 `doctor.json`。研究进度和结果以 `progress.jsonl`、`report.json`、
-`discovery.json`、`adaptation.json` 和 `target_ledger.json` 为准。
-当前实验使用 Stage 1/2 `high`、冻结评估 `medium`，区别于论文 Stage 1 的最高等级和 Stage 2 的 `medium`；
-旧 v6 的最高等级单策略耗时约 9–20 分钟，并出现超时，因此本轮降低该等级，且在清单中冻结。
-
-本轮修复了旧 v6 在首轮修订前发生的上下文溢出：接近 30,000 字符的完整工具库与
-十二条实验索引同时出现时，单纯缩短日志仍无法容纳。现在逐级分页实验详情和场景、
-任务目录，保留每个 rollout 的状态、成绩、动作统计及可读取的完整证据。
-真实 v6 材料的离线重建覆盖普通修订和交互式编码两条路径，后者初始输入约 50,000 字符。
-通用执行提示同时提醒策略区分机器人自身与环境点云，避免全图最高点制造不可达的路径，
-并要求放置后释放、撤手和再观察。这些是框架修复，不是预置抓盘策略。
-针对反复出现的整条路径和纠偏包络预检停止，后续提示建议约 100–150 行的一次性策略，
-组合现有工具、执行短动作并观察，再决定下一步；这是写作建议，不是代码长度评分或重采样条件。
-
-首批已接受能力来自 `discovery/member_00/cycle_01/coding/tests/test_000`：
-固定聚焦集由基线 0/4 提升至候选 3/4，能力库新增三条成功任务。两项抬升任务中，
-盘子最终分别升高约 8.2 cm 和 8.6 cm；完整入箱任务仍在动作前停止。
-代理修订了 `move_segment` 对显式接触反馈参数的覆盖行为。该阶段还经历了有记录的
-提示词维护，各次试验使用新生成策略，因此不能把结果差异全部归因于单一代码改动。
-见 `audits/first_acquired_capabilities.json`；这不是完整入箱或目标域迁移的完成声明。
-
-第二个成员随后独立接受了接触反馈修订，并在 `member_01/cycle_01` 提炼出
-`rim_geometry` 与 `engage_rim`：用运行时 RGBD 选择盘沿，执行分段接近、观测修正、
-闭合和抬升，再返回物体运动证据。对应 `test_001` 从此前 1/4 提升到 3/4，
-三个成功试验都实际调用了该函数，盘子最终抬升约 8.7–9.7 cm；该成员能力库增至三条。
-证据和代码检查记录在 `audits/first_acquired_grasp_procedure.json`。这些结果验证的是
-抓取与抬升过程，运输、释放放置和目标域迁移仍需后续验证。
-
-同一周期随后接受 `draft_032`：新增 `stage_rim`，从实测盘沿选择接近点和姿态，
-执行局部悬停、重观察及精确接近，再组合已有的抓取函数。`test_003` 四项均通过，
-保留此前三项成功，解决第四项在动作前停止的问题；四次都实际执行了两个函数，
-盘子最终抬升约 7.6–9.7 cm，能力库增至四条。中间一个 0/4 的接近候选已被拒绝，
-未覆盖已接受版本。该周期在第 38 次交互结束，进入第三周期；审计记录为
-`audits/member_01_cycle_01_candidate_003.json`。这些仍是抓取抬升任务，并非完整入箱成绩。
-
-第一个成员在 `member_00/cycle_02` 独立提炼并接受了 `rim_geometry` 与 `acquire_rim`。
-前两个候选出现回归；最终 `draft_018/test_002` 将聚焦成绩从 2/4 提升为 4/4，
-两项历史回放判据也全部通过。修订在整体几何一致时保留已观测的盘沿方向，并用
-实测盘沿上部高度避免轮廓边界的过低接触目标。四项聚焦任务最终抬升约 8.1–9.7 cm，
-六次试验均执行了抓取函数，其中五次使用了保留接触点的分支。该周期在 24 次交互后结束，
-能力库累计八条、本轮确认六条；详见 `audits/member_00_cycle_02_candidate_002.json`。
-历史移动任务虽通过位移判据，末态仍有指端接触，不能把它当作释放放置证据。
-
-第二个成员第三周期的探测为 5/8，`member_01/cycle_02/probes/007` 首次核实了完整
-源域入箱释放：实际调用已有接近和抓取函数后完成搬运、开爪、撤手，最终夹爪张开约
-8 cm、TCP 从释放位置撤离约 17 cm，盘子留在箱内且末态无指端接触。释放后继续记录
-约 12 秒，最后 5 秒的全部采样均通过抬升、入箱、红盘留外判据，盘子保持稳定。
-画面与轨迹核查记录见 `audits/first_verified_released_placement.json`，视频位于该
-rollout 的 `public/overhead.mp4`。这是一次新生成策略的真实源域成功，不能据此宣称
-泛化或 Stage 2 已完成。
-
-两个成员的三周期训练已结束，共完成 170 次源试验，冻结版本分别为第一个成员的
-`cycle_02/draft_018` 和第二个成员的 `cycle_01/draft_032`。第二个成员最后一周期测试了
-两个搬运候选，但没有接受新的可复用改进：最后一批仍为聚焦 0/4、历史回放 1/2，
-六次都未开爪，随后在第 39 次交互结束。能力库累计分别为 8 条、9 条历史成功记录，
-不是泛化成功率；训练检查点见 `audits/stage1_training_checkpoint.json`。独立冻结选拔
-已完成，每成员执行了 9 个完整任务和 4 个辅助任务。原评分选中成员 0；因释放判据
-缺陷，后续改用上述独立修正版，原运行不继续目标域适应。
-
-第一个成员的 `member_00/cycle_01/coding/tests/test_002/rollouts/003`
-首次通过原入箱判据，但策略在下降受阻后仍夹着盘子，
-没有打开或撤手，私有记录也显示最终指端接触。因此这次不能认定为完整释放放置。
-原始成功记录保留，补充审计见 `audits/first_inside_predicate.json`；整批 2/4 低于
-已接受版本的 3/4，该候选已被拒绝。
-
-首轮真实实验完成 8 次探测及 4 次聚焦基线，均未通过各自的任务判据；其中 10 次有机械臂运动。
-这些记录只说明初始能力不足，不是完整入箱或迁移成功。优化从同一断点继续，已完成的物理试验不重跑。
-编码循环的上下文回归现同时覆盖初始请求、证据读取后的下一轮，以及候选测试后重复出现的基线/候选结果。
-完整代码接近输入上限时，压缩后的单次实验摘要通过详情索引访问脚本、轨迹及图片，保留每个试验的状态与成绩。
-
-策略 stdout 现在完整保留并通过证据中介分页；旧结果中的 16,000 字符截断可从同目录的
-`policy_stdout.log` 恢复，不修改原始结果。基础设施中断的日志仍不交给模型。
-诊断摘要区分最外层操作成功与内部尝试的失败记录，避免将已经接受的运动误标为失败；
-原始动作、模型响应和独立评分均保留。恢复及审计记录在运行目录 `audits/`。
-
-编码循环还显式记录已返回的证据区间、重复读取和空页，避免无状态调用反复读取相同日志。
-提示要求笔记保留具体发现，并为修改、测试、决定留出交互预算。首次恢复后模型提交了
-说明文档候选并开始定向测试；这只表示研究循环恢复，不能视为能力已获得。
-后续研究指令还要求：当新策略反复且不一致地实现相同步骤时，从已有成功和失败证据
-提炼可复用工具函数，检查新策略是否实际调用；不把整段成功脚本或固定场景坐标存成技能。
-维护中断的已收费调用仍消耗一次交互，不退还预算，也不重复已完成的物理试验。
-最近候选的完整测试结果现通过 `latest_test` 持续提供，读取日志后仍可直接访问；
-默认图片也对应最近候选，避免切回基线造成混淆。候选和基线的身份、成绩仍分别标明。
-
-使用当前真实工具库和十二条公开源试验记录的 Stage 2 上下文离线检查已通过：
-约 425 万字符的原材料整理为约 3.7 万字符的初始输入，所有成绩保留，日志仍可分页读取；
-修复请求也可保留完整当前代码并使用精确编辑。记录见
-`runs/validation_reproduction/stage2_context_rehearsal.json`；此检查没有模型或物理调用，
-不代表已经执行目标适应或验证迁移效果。
-
-新启动的物理进程在已有录像采样时刻将机器人状态和物体真值写入
-`private/object_trace.jsonl`，供最终释放、撤手和稳定性复核使用。该文件不进入策略或
-研究模型的公开证据，采样不推进物理时间，也不改变冻结任务评分；此前试验不补跑。
-缺少该轨迹的旧试验仍需结合原始视频和末态指标核查，不能仅凭几何入箱判据声称完成释放。
-`scripts/audit_placement.py` 还报告开爪后最后 5 秒的采样时长、各采样入箱判据、
-速度和位置漂移；不足 5 秒或缺少测量会明确标记，避免将初始下落与末态持续运动混为一谈。
-这些是离线审计字段，不改变训练与评估的冻结评分，也不自动认证接触释放。
-
-## 运行
-
-本机依赖：RTX 4090、MuJoCo 3.3.7、Isaac Sim 4.5、`isaac-sim` conda 环境、bubblewrap、系统 ffmpeg、已有 Codex 登录。项目自带隔离 `.venv`，Codex 0.162.1 安装在 `.tools`，实验模型固定为 GPT-6 Astra（`gpt-6-astra`）。全局 CLI 不受影响。
-
-安装脚本还需要已有 `uv`、Node/npm，默认借用 `motionbricks` 的 Python 3.10 创建虚拟环境；可用 `SIMEX_PYTHON` 指定解释器。脚本不会安装 Isaac、系统级依赖或本地 Franka USD。
-
-```bash
-# 重建项目依赖和固定版本 Panda 资产
-bash scripts/setup.sh
-
-# Stage 1 预检：MuJoCo、RGBD、动作、策略隔离、视频和模型连通
-.venv/bin/simex doctor --engine mujoco --run runs/preflight_v6
-
-# 完整小规模实验：有断点时从已有结果继续
-.venv/bin/simex run --run runs/small_v6 --config configs/small.yaml
-
-# 只运行 Stage 1，完成后退出；已有进程时不会再次启动
-bash scripts/run_background.sh runs/small_v6 configs/small.yaml discover
-# 完整流程需显式选 run
-# bash scripts/run_background.sh runs/small_v6 configs/small.yaml run
-
-# 分阶段执行
-.venv/bin/simex discover --run runs/small_v6 --config configs/small.yaml
-.venv/bin/simex adapt --run runs/small_v6 --config configs/small.yaml
-.venv/bin/simex evaluate --run runs/small_v6 --config configs/small.yaml
-.venv/bin/simex report --run runs/small_v6
-python3 scripts/status.py --run runs/small_v6
-python3 scripts/verify_run.py --run runs/small_v6
-```
-
-2026-10-16 已停止 `small_v3` 的实验服务及全部子进程；该次 16 个源试验均未发出机械臂运动指令，记录保留在 `runs/small_v3`。随后 `small_v4` 在第一轮修订调用因连接超时退出：12 次源试验均有机械臂运动，但没有任务成功，正式目标试验尚未开始。两次运行记录保留。v5 的两个成员在完整任务选拔中均为 0/9；这些记录保留作诊断。本轮 v6 改进初始通用工具和 Stage 1 学习闭环，默认使用全新的 `runs/small_v6`，由操作者手动启动。不要把旧版工具库复制成新实验初始能力，也不要混接不同版本的结果。恢复时仍检查预算、模型、阶段运行配置和依赖版本；不再检查实现或文件的哈希。
-
-旧运行已整理为 `runs/archive/legacy_20261016/records.tar.gz`；归档保留逐次结果、策略、工具库版本、模型输入输出、全部视频/图组、关键故障 RGBD 和已有目标试验证据。`manifest.json` 列出保留文件及 SHA-256。重复 RGBD/截图和过时调试帧已删除，约 4.03 GiB 原始文件缩为 168 MiB 压缩归档。这些是不完整的诊断记录，不是复现成功率报告。
-
-`discover` 只检查 MuJoCo 与模型，不要求 Isaac。`run` 进入适应阶段以及单独执行 `adapt` / `evaluate` 时再检查 Isaac；源引擎通过不会替代目标检查。`doctor --engine all` 可同时检查两者，`--offline` 不调用模型。首次 Isaac 启动可能花几分钟编译 RTX 着色器；缓存后通常更快。`doctor` 同时检查从初始 RGBD 出发的主动观察：`inspect` 必须实际移动、获得更细的图像采样。运动诊断没有搬盘，其 rollout 的任务分数为 `failed` 是预期，诊断本身另外检查 `passed`。
-
-`configs/smoke.yaml` 是另一个更小的工程测试协议，使用单独运行目录；它的结果不能替代 `small.yaml`。手动 `rollout` 输出位于 `debug/`，不进入正式目标试验计数。
-
-```bash
-# 生成并执行一个源仿真策略，保留全部证据
-.venv/bin/simex rollout --run runs/debug --engine mujoco --task far_plate
-
-# 固定已有脚本回放，禁止再次生成策略
-.venv/bin/simex rollout --run runs/debug --engine mujoco \
-  --script path/to/policy.py --toolbox path/to/toolbox_dir --label replay
-```
-
-## 实验协议
-
-`small.yaml` 的旧模式 Stage 1 使用两个独立成员，每成员三轮，每轮 8 个探测任务、4 个聚焦任务、最多两次工具库修订和最多两个历史能力回放。成员按轮次交替执行，在相同边界读取其他成员上一轮的简短摘要；不交换实现。各自的工具库、能力库和研究历史独立。GPU 上的物理执行仍然串行，这是对论文并行种群的工程改编。
-
-周期开始时冻结的 `peer_summaries.json` 同时进入任务生成、聚焦以及后续工具库修订，弥补无状态模型调用之间的上下文丢失。摘要仍仅包含前一周期的实验结论，不随其他成员当前周期的进度更新，也不包含其他成员的代码；同伴的成功不能计入本成员能力库，必须独立实现和测试。
-
-每次 Stage 1 探测、聚焦测试和历史任务回放仍重新生成一次 CaP 策略，符合论文 §2.1、§2.3、附录 A.2；不能把历史成功脚本当作额外持久技能。历史脚本和计划仅作为实验诊断证据交给优化代理，帮助将成功机制提炼到 `toolbox.py` 和 `skill.md`。聚焦和修订代理能看到实际执行的代码、结果、图组及成功探测；候选评审还收到任务判据、当前/候选工具库及差分。被拒候选的代码、成绩和原因会传入下一次修订，最近两轮的研究摘要也会延续。
-
-能力库保存任务、首次/最近成功的脚本和工具库哈希，以及最近实际观测结果。回放按通用判据结构覆盖和历史使用次数选取，轮内冻结，避免始终只选最后两个任务。新策略失败不会抹掉历史成功。聚焦分数下降或当前通过的回放变失败时不接受候选；若历史任务在当前与候选新策略中均失败，代理必须明确说明接受该不确定取舍的理由，否则保留当前版本。不同新策略的成绩变化不能单独证明工具库发生了因果退化；平分也不能单独证明改进。
-
-代理生成任务、可执行 JSON 成功判据、修订及候选决定。内置提示词和任务描述统一使用英文，不额外强制模型回答的语言。仅根据预先冻结的源仿真选拔集选择成员，不访问目标结果。修订和评审提示中的执行代码属于同一成员的研究证据，不会传给随后的一次性策略调用。
-
-v5 将研究决策与一次性策略生成分开：优化代理先看全部场景的结果摘要、运动统计和证据编号，再通过 JSON `evidence_requests` 请求特定日志、代码页或图片。中介只服务该次调用已获准的公开证据，不开放文件系统、隐藏目标参数或其他成员的实现。原始证据继续完整保留；相同文本按哈希去重，摘要中的省略明确标注并可分页读取。当前版本将源码可见性与输出方式分开：序列化工具库不超过 64,000 字符时，`toolbox.py` 和 `skill.md` 的完整内容固定保留在每轮输入中；超过 30,000 字符则只允许局部替换。更大的库需先按页读取相关源码，再返回 `edits`。中介要求旧代码块唯一精确匹配，应用后验证完整候选文件。这样无需从摘要重建代码，也不会覆盖未查看的原有函数；非法替换消耗候选名额，不自动重采样。
-
-公开轨迹的全部机器人状态样本保留为 `robot_trace`，可通过证据 ID 分页读取。原始关键帧、主动观察图像和动作边界截图也保留为可分页读取的图片目录；读取目录可获得各张图片的 ID，再请求指定图片。默认仍优先附带阶段图像，原始轨迹和图片目录不会挤满摘要；访问范围限定为本次 rollout 获准的公开证据。
-
-单次研究输入硬上限为 **128,000 字符（不是 token）和 4 张图片**；默认摘要上限 34,000 字符，完整工具库较大时继续压缩摘要。原 64,000 字符上限下，约 35,000 字符的候选库需要分页，实际出现源码、说明与失败脚本之间的反复切换，因此扩大容量以保留完整工作源码。普通 `_ask()` 研究决定最多 **20 次交互**，包括最多 19 轮证据读取和最后一次决策；每轮读取最多 4 项、最多 16,000 个序列化字符，按剩余上下文空间进一步限制。最新读取页和最多 2,000 字笔记替换上一轮内容，不无限追加历史。正常研究调用及非网络错误计入 `max_agent_calls`，确认的网络连接失败不计入，也不占交互轮次。这些是本地工程限制，并非论文给出的参数。
-
-### 交互式能力发现
-
-独立配置 `configs/coding.yaml` 启用 `discovery_mode: interactive`。每个成员的每个周期先完成原来的探索、聚焦任务设计和基线测试，然后进入 `discover_code` 编码循环，最多 **40 轮交互、10 批候选完整测试**。旧参数 `revisions` 在此模式下不生效；其他研究决定仍是最多 20 轮，目标适应和最终评估流程不变。
-
-```bash
-# 使用新的运行目录；不会转换或覆盖已有研究运行。
-.venv/bin/simex discover --run runs/coding_v1 --config configs/coding.yaml
-
-# 后续阶段及恢复沿用同一配置。
-.venv/bin/simex adapt --run runs/coding_v1 --config configs/coding.yaml
-.venv/bin/simex evaluate --run runs/coding_v1 --config configs/coding.yaml
-.venv/bin/simex report --run runs/coding_v1
-python3 scripts/status.py --run runs/coding_v1
-python3 scripts/verify_run.py --run runs/coding_v1
-```
-
-模型每轮选择一个操作，程序负责执行并提供反馈：
-
-| 操作 | 作用 |
+| 文件 | 职责 |
 |---|---|
-| `read` | 使用 `evidence_requests` 按 ID 读取公开代码、轨迹、图片及历史；读取范围和大小沿用现有限制 |
-| `edit` | 提交 `files`（完整的两个文件）或 `edits`（最多 16 处精确替换）及非空 `hypothesis`，立即返回静态检查结果 |
-| `test` | 用当前合法草稿运行完整的聚焦＋回放任务组；同一草稿重复请求时复用已保存结果 |
-| `decide` | 提供 `draft_id`、`test_id`、布尔 `accept` 及非空 `reason`，由程序检查后接受或拒绝 |
-| `reset` | 恢复最近接受的工具箱 |
-| `finish` | 提供结束理由，保留最近接受的工具箱并结束本周期 |
-
-编码循环仅能修改 `toolbox.py` 与 `skill.md`，不开放任意文件或命令执行。当前草稿超过 30,000 个序列化字符时只允许精确替换。替换失败保留原草稿；语法不合法的草稿可继续编辑，但不能测试。每次修改会返回文件、错误位置及相关代码片段。检查失败、无效 JSON 和错误操作消耗交互轮次，不占候选测试名额。
-
-工作草稿与已接受版本分开保存。拒绝后可以继续修正该草稿；接受后更新正式版本、比较基准和能力库。测试结果由同一个编码模型分析，不额外调用 `discover_select`；程序仍阻止聚焦分数下降、当前通过的回放变失败，以及缺少明确历史取舍说明等情形。修改过但未经重新测试的代码不能被接受。每批候选测试仍为各任务重新生成策略，物理执行串行，策略生成最多并发三路。
-
-40 轮包括读取、修改、请求测试、提交决定和结束；测试内部的策略生成另外消耗总调用预算。新测试至少要留下下一轮交互供模型作决定。10 批用完后仍能读取和决定；40 轮耗尽则结束本周期，保留最后接受的版本。当前独立配置的总调用预算为 2000 次；额度并不保证所有周期都能用满。确认的网络失败最多重连 5 次，不扣交互或总调用预算。
-
-每周期的 `coding/turns/` 保存请求、响应、操作反馈及提交后的状态；`coding/drafts/` 保存不可覆盖的草稿；`coding/tests/` 保存每批测试；`coding/evidence.context/` 保存可持续读取的证据。完整操作历史可按 ID 读取，最近两个周期的摘要与完整历史引用会提供给后续研究。`coding/summary.json`、总报告和状态查询展示轮次、草稿、检查失败、测试批次、接受次数及结束原因。
-
-恢复时复用已完成的模型响应和操作，不重复已完成实验；已开始但没有明确结果的实验仍停止等待处理。总预算耗尽和基础设施中断保留未完成状态，预算耗尽不会生成永久的策略失败缓存。不进行哈希校验。旧运行缺少模式字段时继续按旧流程恢复；模式和编码上限在初始化后不可更改，新增实验使用新目录。
-
-独立源任务的策略生成最多并发三路，物理执行保持串行。v6 选拔排除没有有效物理执行的成员，依次比较完整任务成功数、共同辅助任务成功数、有效执行数，最后按成员编号确定顺序；不再奖励更早失败。完整选拔集仍为三个任务各三个场景；额外四项共同辅助任务为两个场景的 5 cm 抬升和两个场景的 3 cm 位移，初始化时冻结，仅在成员工具库冻结后执行，不反馈给训练课程。
-
-v6 每轮任务生成使用当前源场景模板，默认继承 30 g 盘子；若研究质量、摩擦或尺寸变化，提示要求在提案 `scene_change_reasons` 中按任务序号解释实验变量。中介按物体名称记录实际变更字段；缺少解释会标记 `missing_reason` 并传给聚焦分析，不因缺少备注重采样任务或中止研究。位置变化无需额外理由。各任务与模板的差异保存为 `probe_scene_variations.json` / `focused_scene_variations.json`。probe 成功在选择当轮 replay 前入库，聚焦基线和已接受修订的成功及时保存，避免当轮刚获得的能力遗漏回放保护。动作摘要区分闭合、张开、最低 TCP、闭合后的上升、拒绝和终止信息；这些仅是执行证据，不能证明抓稳。
-
-当前 `small.yaml` 的 Stage 1 推理等级为 `max`，Stage 2 为 `high`，三个方法的冻结评估均为 `medium`。所有阶段的模型固定为 `gpt-6-astra`，不读取本机 Codex 的模型选择；配置中的 `model` 可省略或为 `null`，显式指定其他模型会报错，`--model` 也只接受 `gpt-6-astra`。这里不使用带自动委派的 `ultra`，以保持单次纯文本策略调用。Stage 1 单次调用超时为 1200 秒，其余默认 600 秒；模型、推理等级和超时均记录在每次 `request.json` 并纳入运行指纹。
-
-Stage 2 的三个任务分别从相同 Stage 1 结果开始，各最多 5 次 Isaac 试验。每次先固定脚本与当前工具库，在源仿真中校准；然后比较当前版本及两个候选，进行固定脚本回放和三个泛化任务测试，由代理选择修复。源模型校准每轮最多三次。同一任务后续轮次保留此前候选和选择理由；不同任务的适应历史不共享。非法工具库候选会消耗一次候选名额并记录失败，恢复时不会反复卡在同一提案。
-
-三次校准上限是本地预算限制，不能视作相关行为已被复现。首个修正版试验中，
-目标域掉盘、源域仍保持夹持的差异在用完校准预算后依然存在，详见
-`runs/reproduction_release_20261021/audits/first_controlled_replay.json`。
-两边同时失败不足以证明对齐；后续筛选须结合剩余差异解释，不能只比较得分。
-
-对齐器现在通过 `alignment_history` 接收本轮每次校准的参数、提案和对应公开回放，
-修复假设、候选实现和选择也接收同一历史。`alignment/history.json` 保存这些材料，
-任务摘要保留精简版本，供该任务下一轮使用，不跨任务共享。
-`agent_confirmed_aligned` 表示代理评估过当前回放并确认相关行为匹配；
-`update_limit_reached_unconfirmed` 表示校准预算已用完但尚未确认匹配，最后一次更新后的
-回放可能还未被对齐器评估。恢复时从已有决定和回放重建历史，复用旧决定，
-不增加校准名额、不改变参数范围、评分或目标策略提示，也不重新执行已有物理试验。
-
-这项上下文更新在修正版完成两次目标试验后加载。首轮决定和第二轮已经生成的第一个
-候选原样复用；后续研究调用才收到新增历史，不能声称此前的调用已经使用它。
-全套 503 项测试、68 项报告与恢复补充测试，以及真实材料的上下文容量演练均通过。
-维护中断的模型调用照常计费；前后检查确认 24 份已完成仿真结果未改变。
-操作记录见 `runs/reproduction_release_20261021/audits/alignment_history_maintenance.json`。
-
-校准器还可通过只读证据访问两端实际使用的当前 `toolbox.py` 和 `skill.md`。
-此前输入只有固定策略和执行证据，策略调用的辅助函数实现不可读，难以区分物理差异与
-函数自身的接受、纠偏和停止逻辑。工具库内容仍走相同的有界分页通道，不授权校准阶段改代码。
-106 项研究流程及上下文回归通过，真实运行材料验证了逐字读取、四张图片上限和输入长度限制。
-维护在近箱任务首轮三次校准全部完成后、只读修复假设调用处加载；已完成试验和决定继续复用，
-后续未缓存的校准请求才使用补充证据，不增加预算或改动模拟器参数。
-近箱第二轮的实际请求 `00270_align` 已携带完整工具库证据；证据文件与冻结库逐字一致，
-模型实际请求读取了 `move_checked`，用于区分目标侧跟踪失败与源侧时间预算终止。
-记录见 `runs/reproduction_release_20261021/audits/alignment_toolbox_maintenance.json`。
-
-近箱第三轮的假设生成用满 19 次读取，累计请求 33 页工具库内容，其中同几段代码各被重复
-请求 6～8 次。现在 `align` 和 `repair_hypotheses` 对序列化后不超过 64,000 字符的当前库，
-在每轮输入持续保留完整代码与技能说明；更大的库继续分页。该变化不引入代码改写输出协议，
-不改变 128,000 字符、四张图片或读取轮数上限。114 项回归通过，真实材料演练的最大请求
-为 103,304 字符。维护在近箱第三轮第一个候选保存后、没有活动模型调用的节点加载；
-124 份已完成物理试验及 823 份记录内容保持不变。已缓存决定继续复用，后续新请求才采用
-此输入组织方式；实际读取轮数或任务表现的改善仍需后续结果证明。记录见
-`runs/reproduction_release_20261021/audits/readonly_code_context_maintenance.json`。
-近箱第四轮的实际校准与修复假设请求已核对完整代码常驻，并与冻结库逐字一致。
-
-依照论文 §2.4 Step 2，校准提示进一步要求先指出与任务结果有关的行为及发生阶段，
-再解释观测、物体响应和策略决定是否复现。中间采样或指令数量的差异须说明与该行为及
-后续修复测试的关系；对尚未执行的接触、搬运和放置保留不确定性。候选选择也明确允许
-基于因果证据积累局部修复，但必须分析后续失败及退化；多走几步或提前停止本身不算改善，
-失败试验仍记录为失败。此修改不改变评分、模拟器、实验次数或预算，已完成判断保持原样。
-114 项研究流程及上下文回归通过。修改在近箱第四轮两个候选保存后、没有活动模型调用或
-物理执行的节点加载，141 份仿真结果及 929 份记录内容保持不变；未新增中断调用。
-加载节点和后续实际请求记录见
-`runs/reproduction_release_20261021/audits/outcome_relevance_maintenance.json`。
-
-公开动作摘要新增 `first_close_response`，记录首次闭合命令返回时的实际开口、
-下一次机械臂动作的等待间隔、起止开口与 TCP 位移。遇到新的夹爪命令即停止关联，
-缺失测量保留为空；命令结束不等于手指已稳定，也不能证明接触或抓稳。
-压缩概览保留闭合端点与下一动作开始的关键测量，完整细节继续分页可读。
-161 项相关回归通过，真实材料演练保留全部 12 个筛选结果和完整当前工具库，
-最大读取请求为 93,951 字符；演练没有改写活动运行的证据缓存。
-修改在第 14 次目标试验的首个候选保存后、没有活动调用或物理执行的节点加载，
-218 份物理结果和已有决定保持原样，未新增中断调用。恢复时重新生成了 27 份派生
-历史或摘要，逐份移除新增字段后与原内容哈希一致；进度报告正常更新。
-第二个候选的实际请求 `00565_repair` 已验证携带该诊断。
-验证见 `runs/validation_release_contract/closure_context_rehearsal.json`，加载记录见
-`runs/reproduction_release_20261021/audits/closure_diagnostics_maintenance.json`。
-
-目标场景重建只使用初始 RGBD 的颜色分割与反投影估计，保留标称几何与物理参数，不复制目标物体真值。可校准项是质量、摩擦、相机偏移和动作时长。`friction_scale` 统一缩放源仿真全场景的滑动摩擦（盘、桌面和夹指），使合成后的接触摩擦也按比例变化；`scale=1` 保留基线值。私有诊断记录实际接触参数，回归测试检查缩放的灵敏度。
-
-校准提示明确参数的作用范围：`mass_scale` 只缩放盘子质量，不改变机械臂连杆惯性或控制增益；
-`controller_duration_scale` 缩放运动、夹爪和等待时长，不改变物理步长或伺服增益；
-`camera_offset` 平移两台源相机的安装坐标，返回的相机标定仍与其位姿一致。
-这项说明补充用于避免把物体质量变化误当成空载机械臂动力学变化，不修改参数实现或历史决定。
-说明在第四次目标试验及其校准完成后加载，71 项研究流程回归通过；维护记录见
-`runs/reproduction_release_20261021/audits/calibration_scope_maintenance.json`。
-
-源摩擦校准范围现为 `[0.03, 2]`，此前下界为 `0.3`。前三次目标试验都出现提起后掉盘，
-对应源回放在旧下界仍能保持抓持，因此另做了不进入研究代理上下文的固定脚本灵敏度诊断：
-`0.3` 复现已存档的源成功，`0.1` 提起约 5.3 cm 后掉回桌面，`0.03` 未形成有效提起。
-诊断只验证扩展范围有实际作用，不证明校准已完成，也不计入适应或评估统计。
-此次维护发生在第三次目标试验及其三次校准回放完成之后；旧决定与回放继续复用，
-后续未缓存的校准决定才可以选择扩展范围。校准次数、目标次数、模型总预算和评分保持原值。
-记录见 `runs/validation_friction_sensitivity_20261021/diagnostic.json` 和
-`runs/reproduction_release_20261021/audits/friction_bounds_maintenance.json`。
-
-筛选场景生成器现在接收实际应用的 `source_config`，并获知固定源资产的接触摩擦合成规则：
-盘—桌为 `max(盘材料摩擦, 0.7)`，盘—夹指为 `max(盘材料摩擦, 1.0)`，之后再统一乘
-`friction_scale`。因此，单独把盘材料摩擦设为 0.5、0.6 或 0.7，不会形成这些接触摩擦的
-差异；已有近箱首轮三个场景的记录确实如此，只能支持几何变化下的比较。
-后续生成器可据此选择有效的质量或接触摩擦变化，不把材料值变化误当作有效摩擦变化。
-这次补全通过 72 项研究流程回归和已存源接触参数核对，只作用于未缓存的场景生成请求；
-已有场景、评分和物理实现保留，记录见
-`runs/reproduction_release_20261021/audits/screen_context_maintenance.json`。
-近箱第二轮实际请求 `00308_screen_tasks` 已携带当前校准参数，生成的共同场景及源侧记录
-确认质量由 30 g 变为 60 g，以及盘—桌/盘—夹指有效摩擦由 0.35/0.5 变为 0.7/0.7。
-这证明筛选覆盖了实际物理变化，不代表候选已通过这些场景。
-
-| 项目 | small 配置 |
-|---|---:|
-| 独立研究运行 | 1 |
-| 目标适应 | 3 任务 × 5 次 = 15 |
-| 冻结评估 | 3 方法 × 3 任务 × 5 次 = 45 |
-| 正式目标试验总数 | 60 |
-
-三个方法为初始工具库 Direct CaP、Stage 1 直接迁移、完整 SimEX。共享评估种子，各次生成新策略；结果冻结后不反馈给优化代理。
-
-任务是远侧单盘、远盘到近箱、箱体偏移后的单盘。绿色薄盘需抬升至少 5 cm，最终完整位于箱内且线速度低于 0.05 m/s，红盘需保持在箱外。原始 `legacy_geometry` 判据不检查持续稳定时间；修正版的 `released_placement_v1` 另检查松爪、撤离、手盘分离与稳定窗口。没有物体吸附、瞬移或辅助固定约束。两引擎都使用真实电机、夹爪接触和重力；MuJoCo 中保留的指间耦合约束属于机器人本体。
-
-原始运行的冻结判据只检查物体的位置、姿态、速度和历史抬升，不单独要求夹爪张开或退出接触。该运行已出现夹爪仍闭合但盘子满足箱内几何判据的记录，因此应将“几何入箱成功”和“完成释放放置”区分。原始审计注释保存在运行目录的 `audit_notes.json`，修正版的严格释放证据保存在各次试验的私有指标与审计文件中。
-
-## 接口与隔离
-
-策略得到 `robot` 和 `tb` 两个对象。`RobotAPI` 只暴露：
-
-```python
-robot.observe(camera="overhead")  # RGB, metric depth, K, camera_to_world
-robot.state()                    # joints, EE pose, gripper width, sim time
-robot.ik(position, quaternion)    # scalar-first quaternion: w,x,y,z
-robot.move_joints(joints, duration=1.0)
-robot.move_ee(position, quaternion, duration=1.0)
-robot.gripper(width, force=40.0, duration=0.5)
-robot.wait(seconds)
-```
-
-米、弧度、世界 Z 向上；相机为 OpenCV 坐标。夹爪 `width` 是两指总开口，`force` 是每指的电机力上限（N），两端保持相同语义；该值不代表实际测得的接触力。策略单次动作时长为 0.01–15 s，`wait` 为 0–15 s；源控制时长校准在输入校验后应用，包含省略参数时的默认时长，`wait(0)` 不推进仿真。TCP 为夹指中心，手部局部偏移 `[0,0,0.1034]`，两个后端的关节顺序一致。
-
-两端的底层夹爪响应仍有差异：MuJoCo 在动作时长内线性改变耦合肌腱目标，Isaac 立即设置
-双指目标后推进仿真；驱动模型与碰撞表示也不同。因此，相同开口、力上限和动作时长不保证
-相同接触或收敛过程。静态资产及适配器检查记录在
-`runs/validation_release_contract/gripper_interface_review.json`；该检查不识别实际掉盘原因。
-
-策略在无网络、最小文件挂载且清空继承环境的 bubblewrap 进程中执行。物理工作进程通过受信任中介只接受上述公开调用；评分器和真实物体状态不进入策略进程。Python AST 检查是辅助约束，实际隔离依赖操作系统命名空间和中介接口。
-
-编码代理收到公开实验摘要及按实验分别标注的阶段图组。每个场景保留证据索引，首轮最多附带四张图，其余图片由研究代理按编号读取；附件清单及哈希另行记录。项目、私有实现与运行数据在其挂载中隐藏。登录文件只读挂载，临时 CLI 状态在退出时销毁。所有策略生成是单次纯文本调用；检测到工具执行或非法策略即判失败。
-
-初始工具库提供通用 `move_checked`、`move_path` 和 `visibility`。前两者保存绝对目标并检查实际 TCP/姿态误差；纠偏次数、偏移范围和可选几何 guard 均有界，接触阶段不能把受阻当作伺服偏差强行纠偏。后者区分相机射线上观测为空闲、测得表面、未知；自遮挡、视野外和缺失深度不能直接当成碰撞，也不能当成通行许可。它们没有盘子专用抓取点、搬运路径或释放顺序，三种方法共享相同初始版本。
-
-v6 增加通用 `outline_points`、`fit_plane`、`fit_circle` 与 `move_segment`。圆拟合的半径范围由调用方提供，返回残差、内点比例与可见弧覆盖；局部遮挡时可结合表面平面拟合轮廓，避免直接把可见点中位数当完整物体中心。拟合残差和像素采样都不等于真实定位误差。
-
-`move_checked` 保留原严格默认，新增 `accept_position_tolerance`；普通 API 跟踪失败时仍检查实测位姿，不可达、关节截断及 guard 拒绝等硬失败保留。`move_segment` 默认每 20 mm 一个绝对路点，自由运动最多两次、总计 25 mm 纠偏，先追求 3 mm，最终可按 15 mm 接受；接触/持物模式关闭纠偏。最后夹持对准应显式设置严格验收精度，15 mm 只适用于允许该误差的转移。姿态容差维持 0.05 rad。夹爪包装器开放宽度、力上限和时长；初始库没有预置 `direct_plate` 的抓取参数或整套策略。
-
-固定策略提示明确：技能说明中的抓取保持等建议只适用于该技能的阶段，不能变成禁止完成上层任务的永久规则。中间技能成功不等于整体任务完成；策略仍须根据 RGBD 与公开状态选择后续动作，并遵守信息隔离。
-
-v4 增加通用 `measure` 和空夹爪主动观察 `inspect`。后者用 RGBD 粗定位与公开的相机/TCP 位姿生成观察路点，分步检查 IK、关节变化、跟踪误差和时间预算，改善腕部图像采样。它不包含抓盘接触点、夹紧、抬升或搬运策略。观察路线根据已识别物体表面估计，适用于当前静态桌面场景；不声称完整覆盖所有机械臂连杆或不可见障碍。三种比较方法共享相同初始能力。
-
-策略允许在仿真中进行有预算、带反馈的试探；不再要求先获得完整碰撞证明或精细盘沿尺寸，才允许非接触观察移动。视野未知仍保留为未知，不伪装成自由空间。像素采样、深度误差、接触精度分别处理；评分判据、真实接触和真值隔离保持原定义。Stage 1 的任务生成会参考已有能力安排前置实验；代理仍自行选择任务和判据。修订评审会检查新路径是否实际执行，零动作的代码扩展不能宣称解决了探索问题。
-
-## 结果与恢复
-
-每个运行目录包含：
-
-- `manifest.json`、`runtime.json`：预算、模型、版本、环境和冻结计划。
-- `target_ledger.json`：预分配的目标试验及状态，防止重复执行。
-- `discovery/`、`adaptation/`、`evaluation/`：各次脚本、候选、选择理由和结果。
-- Stage 1 每轮 `replay_records.json`、`capability_bank.json`、`research_history.json`：冻结回放选择、能力来源及跨轮经验；`accepted.json` 区分代理理由与程序回归检查原因。
-- `frozen/`：初始、Stage 1 和各任务适应后的工具库及记录用哈希。
-- 每次 rollout 的 `public/`：MP4、关键帧、策略读取的 RGBD NPZ、机器人轨迹。
-- 每次 rollout 的 `private/`：仅可信评估器使用的场景与真值；不作为代理证据。
-- `agent_calls/`：逐次输入、输出、事件、实际图像附件及哈希、服务返回的 usage；超时保留已收到的部分输出。
-- 各研究决定旁的 `*.context/`：证据索引、去重后的公开材料、摘要、逐轮请求和回答、连接重试记录；恢复时复用已完成读取轮次，不校验哈希。
-- `report.md`、`report.json`：已完成/排定数量、成功率、适应曲线数据和失败状态。
-
-报告单独列出 Stage 1 流程完成、基础能力得分和入箱判据通过数，并提供选拔中所有成功/失败的视频路径。被选中成员在完整任务选拔中至少通过一次，才标记 `full_task_predicate_verified=true`；兼容字段 `full_task_verified` 含义相同。原运行的 `full_task_verification_scope=frozen_task_predicates` 不含释放与撤手，`released_placement_verified` 保留未知。修正版的范围为 `released_placement_v1`，按测得的开爪、撤手、分离和稳定入箱证据判定释放，继承的源选拔结果明确标记为保存轨迹重评。报告的 `complete` 仅表示排定流程与物理执行来源完整；能力结论还须结合各方法的成功数、分母和录像，不能只看流程完成标志。
-
-相同命令会复用已完成结果。超时、非法策略、执行失败消耗排定试验；策略沙箱尚未连接时的启动故障、初始 RGBD 故障属于基础设施故障，可修复后恢复。连接后发生后端故障则将目标试验标为 `unresolved_infrastructure` 并停止研究；它保持未完成、不计入实测成功率，也不自动重跑。源侧基础设施中断也不会作为候选失败进入筛选。若崩溃后无法判断目标试验是否执行，流程停止并记录 `unresolved`，不会悄悄重跑。配置中的研究轮数、目标试验数、随机种子和模型设置仍不可在恢复时更改；模型调用资源上限 `max_agent_calls` 可由操作者另行调整。
-
-重试启动故障前，旧 `result.json` 会移入 `research_attempts/prior_results/`，避免中断后把旧失败当作本次结果。若 `execution.json` 表明策略已开始，而本次结果尚未保存，源侧停止执行，目标名额标为 `unresolved_infrastructure`；旧的启动失败结果不能覆盖这条执行记录。已有 `policy_generation.json` 时可复用策略生成结果，即使模型调用预算已经耗尽，也可以完成后续仿真而不新增模型调用。
-
-运行流程、诊断缓存、资源下载和离线审计均不执行哈希校验。哈希仅用于记录、编号和去重；旧档案中的哈希不会阻止恢复，也不会触发策略或试验重跑。诊断通过后按已有引擎状态复用，需要重新检查时显式运行 `doctor`。`verify_run.py` 仍检查文件存在性、目标试验记账、执行阶段和固定脚本重放规则，并返回 `hash_verification=false`。工具库语法/接口校验、直接的文件覆盖保护和源试验任务参数检查仍保留；已保存的提示词与历史模型回答不会被翻译或重新生成。
-
-小规模实验仍可能调用模型数百次，默认上限 800 次。额度耗尽或基础设施错误会留下断点与明确错误，报告不会把未完成评估记成成功或零成功。
-
-研究决策调用遇到明确的网络连接错误且尚无回答时，最多自动重连 **5 次**，即初次连接加 5 次重试；仍失败则保留断点退出。这类失败在 `result.json` 中记录 `failure_kind=network`、`budget_charged=false`，不扣研究调用预算，重启后仍然豁免；每次连接尝试都有独立编号和日志。普通超时不能自动视为网络波动；未识别为网络错误的超时、无效 JSON 和非法策略仍计预算且不自动重采样。策略生成和物理 rollout 没有新增重试；证据读取、重连和恢复都不会再次执行已有目标试验。报告及状态分别展示实际尝试次数、预算用量和网络失败豁免次数，token 统计仍保留服务返回的全部 usage。控制台 `research_request` 显示输入字符数、附件数、原始材料体量和读取轮次，`request.json` 另外记录完整调用的字符/字节计数。
-
-每次结果新增 `action_summary`，控制台的 `source_rollout_complete`、状态查询和报告也显示动作统计。`no_arm_commands` 表示没有调用机械臂运动；`arm_commands_without_measured_motion` 表示发出了指令但没有测得明显运动；`arm_motion_observed` 表示测得机械臂运动。仅等待和夹爪开合不计为机械臂运动，运动次数也不代表抓取成功。旧记录没有该字段时显示 `unavailable`，避免误推断。
-
-`last_cartesian_command_tracking` 仅由公开动作和机器人轨迹计算，展示最后一条笛卡尔指令在动作结束时、后续最后观测时的位置残差、间隔和关节速度。参照是原始 API 目标，可能含策略的反馈偏移，并非策略名义目标；后续关节运动会使该比较失效。该摘要帮助区分持续偏差与仍在收敛的运动，但不自动判定重力偏差、接触、碰撞或任务失败。原始结果保持不变，公开证据缓存按版本更新。
-
-最终放置的离线复核可运行 `.venv/bin/python scripts/audit_placement.py --run runs/reproduction_20261020`，或使用 `--rollout <单次目录>`。它区分原任务得分与完整入箱判据，列出最后一次闭合后的打开动作、后续 TCP 撤离距离、盘子位移及速度；后端提供指端接触记录时也列出最终接触状态，否则保留未知。缺少轨迹时不补造释放结论；打开指令和撤离距离也不等同于接触力测量，仍须检查录像。该工具只读取既有记录，输出包含私有真值，仅供操作者审计，不进入代理上下文、不改变评分。运行级审计排除引擎预检记录。
-
-固定执行提示不再把初始库“接触/持物时关闭补偿”的默认实现作为不可修改的约束。代理可以通过公开状态试验具有明确位移、修正次数和时间上限的反馈或标定方法，并区分持续跟踪残差与实际运动阻挡。初始库代码不因此改变，也没有预置抓盘补偿量或策略；具体修改仍需经过候选测试和接受流程。真值访问禁令、执行预算、物理参数和成功判据保持不变。
-
-后台启动优先使用用户级 systemd 服务（名称保存在 `research.service`）；无可用用户服务时使用独立会话。进程号保存在 `research.pid`，控制台输出持续写入 `console.log`。后台脚本不会无限重试；进程因错误退出时，请先查看 `last_error.json` 和日志，再用相同启动命令恢复。`report.md` 在每个研究阶段完成或出错时更新，也可随时运行 `simex report` 手动刷新。
-
-本机使用 systemd 后台方式时，可停止整个实验及其子进程：
-
-```bash
-systemctl --user stop "$(cat runs/small_v6/research.service)"
-```
-
-## 验证与复现差异
-
-```bash
-MUJOCO_GL=egl .venv/bin/python -m pytest -q
-# 独立真实 Isaac 测试（需要本机资产）
-bash scripts/isaac_python.sh tests/smoke_isaac.py
-.venv/bin/python tests/smoke_isaac_worker.py
-
-# 两个预先固定的源场景，一次性生成策略，验证是否真正发生机械臂运动。
-# 最多两次策略生成；不启动 Stage 1/2，也不消耗正式目标试验。
-.venv/bin/python scripts/validate_exploration.py --run runs/exploration_check_v4
-
-# 只用历史材料检查新证据协议，不调用模型或仿真器。
-.venv/bin/python scripts/inspect_research_context.py \
-  --request runs/small_v4/agent_calls/00016_discover_revision/request.json \
-  --out runs/context_packet_check
-
-# 可选：两次真实模型调用验证“申请证据—读取—回答”，没有物理试验。
-.venv/bin/python scripts/validate_research_context.py --run runs/context_read_check
-```
-
-新增回归测试覆盖拒绝后的反馈、非法候选恢复、每场景证据覆盖、摩擦灵敏度、夹爪力语义、任务参数边界和运行时故障分类。适配器测试使用假进程，不调用实验模型。
-
-v3 另外验证优化代理收到真实脚本、历史能力来源与覆盖采样、双成员公平交换、断点恢复一致性、历史失败取舍、阶段推理设置、固定绝对目标和遮挡分类。完整协议假执行测试排定并核对全部 60 个目标试验，检查第五次适应后不增加验证试验、任务间独立以及评估不反馈给优化代理；它不证明物理任务成功率。
-
-v6 无模型验证命令（输出目录必须为空）：
-
-```bash
-.venv/bin/python -m pytest -q
-.venv/bin/simex doctor --offline --engine mujoco --run runs/preflight_v6_offline
-.venv/bin/python scripts/validate_initial_toolbox.py --run runs/toolbox_v6_recheck --video
-```
-
-2026-10-19 工程验证：全量 **308 项测试通过**。保持 30 g、320×240 及原评分，在三个现有任务的 seed 42 上，将新通用几何/运动工具接入 `direct_plate` 固定流程，完整入箱及独立接触审计 **3/3 通过**；原固定流程在相同低分辨率条件下 **2/3 通过**，`far_to_near` 停在持物轮廓检查。全部六次结果和三视角视频在 [toolbox_final/summary.json](runs/validation_v6/toolbox_final/summary.json)，初次无视频记录也保留。视频放大为 1920×480 展示，控制器输入仍是 320×240。两种流程的几何/运动处理不同，此对照不能单独归因于某一个改动。
-
-MuJoCo 离线预检通过，记录在 [doctor.json](runs/validation_v6/doctor/doctor.json)。这些验证没有模型调用，没有启动正式 Stage 1；固定流程成功证明基础工具可支持任务，不证明 agent 已自主发现技能，也不是未见场景成功率。正式实验请使用上方 `discover --run runs/small_v6` 命令。
-
-v4 回归覆盖初始粗视图下真实移动并提高采样、观察预算、运动失败停止、目标不可见时停止、观察不自动开合夹爪，以及蓝色机器人区域污染箱体高度的感知故障。`doctor` 在两引擎实际执行主动观察，不以“API 可以调用”代替探索验证。验证记录在 `runs/validation_v4/`，包括发现错误时的失败记录；这些工程试验与正式研究结果分别保存。
-
-v4 验证结果：全量测试 229 项及新增真实反馈回归 1 项通过，双引擎主动观察通过。两次新生成策略分别发出 31、27 条机械臂指令，均改善了视角，但仍未抓盘：它们关闭了自由空间反馈，在后续移动误差处停止。最终提示已区分自由空间纠偏与接触模式；没有继续采样模型筛成功。固定原脚本在最终初始库中回放仍失败。详细报告见 `runs/validation_v4/report.md`，不能把观察能力验证当作抓盘或迁移成功。
-
-v5 验证结果：254 项全量测试通过。用 small_v4 实际失败请求离线重建，输入从 807,150 字符降至 52,476 字符（减少 93.50%），首轮附带 4 张图，全部 12 次测试和 12 张图的证据仍保留并可读取。两次真实模型工程调用验证了申请片段后再回答的通路，没有重启正式实验或运行新的目标试验。报告见 `runs/context_fix_v5/report.md`。这不证明外部连接永不超时，也不代表抓盘成功率已改善。
-
-真实 MuJoCo 通用运动冒烟记录位于 `runs/validation_v3/motion/summary.json`。在无负载自由空间的四步下降测试中，使用上一步实测位置生成下一目标产生 18.929 mm 最终位置误差；新的绝对路点与有界反馈将四步误差控制在 0.779–0.965 mm。该验证没有抓盘，没有调用模型，也不能外推为接触抓取或目标迁移成功。
-
-测试覆盖真实 MuJoCo RGBD/反投影、物理接触、IK不修改现场、动作、复位、录像、沙箱边界、严格评分及试验预算/冻结/回放协议。Isaac 的真实测试另行运行，避免常规测试重复占用 GPU。
-
-与论文相比：单臂 Panda 替代双臂 YAM；三个可达改编任务替代七任务；两个成员/三轮替代四成员/二十轮；两个修复和三个筛选任务替代四个/五个；仅一次独立研究运行。相机、资产、控制器、初始工具库与模型也不同，因此报告用于检验方法链路和观察迁移现象，不与论文成功率作直接等价比较。
-
-首版公开任务模板，留出评估场景种子；这与论文对代理隐藏完整评估任务定义的协议也有区别。
-
-论文：随附 `2609.38982v1.pdf`。Panda 来源与许可证：`assets/panda/PROVENANCE.json`、`assets/panda/LICENSE`。本地 Isaac USD 不被重新分发，其路径在配置中指定。
+| `simex/lab/protocol.py`, `records.py` | 冻结配置、版本、配对目标槽位、原子请求和操作台账 |
+| `gateway.py`, `session.py`, `workspace.py` | 宿主模型网关、持久 CLI、阶段权限、证据与提交 |
+| `preparation.py`, `discovery.py` | 公共观测初始化、独立源域能力发现和选拔 |
+| `simex/stage2.py` | 两条入口共用的源模型校准、候选筛选和冻结评估 |
+| `execution.py`, `reporting.py`, `campaign.py` | 物理执行去重、生命周期、审计和报告 |
+| `simex/lab/mock.py` | 明确标记的离线模拟服务和物理测试替身 |
+
+`ref/EmbodiedEvo` 是只读参考，没有运行时依赖。其值得借鉴的设计及未采用的差异，
+见 [来源说明](docs/workspace-protocol.md#借鉴来源)。

@@ -253,6 +253,9 @@ def verify_contexts(root, errors):
 def verify(root):
     root = Path(root).resolve()
     manifest = load(root / 'manifest.json')
+    if manifest.get('protocol') == 'simex_workspace_v1':
+        from simex.lab.reporting import verify as verify_workspace
+        return verify_workspace(root)
     ledger = load(root / 'target_ledger.json')['slots']
     cfg = manifest['config']
     if cfg.get('protocol') == 'supplied_skill_stage2_v1':

@@ -103,14 +103,24 @@ def _ensure_doctor(runner, agent, run_dir, engines):
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description='SimEX small-budget MuJoCo → Isaac Sim reproduction')
+    parser = argparse.ArgumentParser(description='SimEX MuJoCo → Isaac Sim research protocol and legacy tools')
     commands = parser.add_subparsers(dest='command', required=True)
-    for command in ('doctor', 'rollout', 'discover', 'adapt', 'evaluate', 'report', 'run', 'stage2'):
+    for command in ('doctor', 'rollout', 'discover', 'adapt', 'evaluate', 'report', 'run', 'stage2',
+                    'prepare', 'status', 'verify', 'resume', 'stop'):
         sub = commands.add_parser(command)
-        sub.add_argument('--run', type=Path, default=Path('runs/small_v6'))
-        sub.add_argument('--config', type=Path, default=Path('configs/small.yaml'))
+        workspace_command = command in ('prepare', 'discover', 'adapt', 'evaluate', 'run', 'stage2', 'resume')
+        sub.add_argument('--run', type=Path, default=Path('runs/workspace_v1' if workspace_command else 'runs/small_v6'))
+        default_config = ('configs/workspace_supplied.yaml' if command == 'stage2' else
+                          'configs/workspace.yaml' if workspace_command else 'configs/small.yaml')
+        sub.add_argument('--config', type=Path, default=Path(default_config))
         sub.add_argument('--model', choices=[FIXED_MODEL], default=None,
                          help=f'Model is fixed to {FIXED_MODEL}')
+        sub.add_argument('--model-request-limit', type=int,
+                         help='Explicit actual inference request cap for new workspace runs')
+        if command in ('prepare', 'run'):
+            sub.add_argument('--observation', type=Path, help='Frozen public 640x480 RGBD NPZ')
+            sub.add_argument('--workspace-description', type=Path)
+            sub.add_argument('--source-assets', type=Path)
         if command == 'stage2':
             sub.add_argument('--source-only', action='store_true',
                              help='Import and validate the supplied skill in MuJoCo; no model or target calls')
@@ -128,12 +138,45 @@ def main(argv=None):
     args = parser.parse_args(argv)
     run_dir = args.run.resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
+    if args.command in ('status', 'verify', 'stop'):
+        from .lab import reporting
+        result = getattr(reporting, args.command)(run_dir)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 1 if args.command == 'verify' and not result.get('integrity_ok') else 0
     if args.command == 'report':
         print(json.dumps(research.report(run_dir), ensure_ascii=False, indent=2))
         return 0
+    existing = research._json(run_dir / 'manifest.json', {})
+    if (existing and existing.get('protocol') != 'simex_workspace_v1' and args.command in
+            ('prepare', 'discover', 'adapt', 'evaluate', 'run', 'stage2', 'resume')):
+        print('Legacy frozen experiments are read-only under the new implementation; choose a new workspace run.',
+              file=sys.stderr)
+        return 1
     runner = None
     try:
         config = yaml.safe_load(args.config.read_text())
+        existing = research._json(run_dir / 'manifest.json', {})
+        if (existing.get('protocol') == 'simex_workspace_v1' and
+                config.get('protocol') != 'simex_workspace_v1' and args.command != 'resume'):
+            print('A workspace run cannot use legacy settings; use its frozen config or resume', file=sys.stderr)
+            return 1
+        if args.command == 'resume':
+            from .lab.protocol import check_resume
+            config = check_resume(run_dir)
+        if config.get('protocol') == 'simex_workspace_v1':
+            from .lab.campaign import execute
+            for key in ('observation', 'workspace_description', 'source_assets'):
+                if getattr(args, key, None):
+                    config[key] = str(getattr(args, key).resolve())
+            if args.model_request_limit is not None:
+                config['model_request_limit'] = args.model_request_limit
+            if args.model:
+                config['model'] = args.model
+            result = execute(args.command, run_dir, config, source_only=getattr(args, 'source_only', False))
+            print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+            return 0
+        if args.command in ('prepare', 'resume'):
+            raise ValueError('prepare/resume require the new workspace protocol')
         if args.model:
             config['model'] = args.model
         agent = Agent(run_dir, config)

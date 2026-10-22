@@ -1,0 +1,10 @@
+protocol: simex_workspace_v1
+route: supplied
+model: gpt-6-astra
+research_image: simex-research:0.162.1
+repetitions: 1
+camera_resolution: [640, 480]
+placement_contract: released_placement_v1
+source_calibration_profile: code_v1
+seed: 20261025
+# Explicit --model-request-limit and host provider required except --source-only.

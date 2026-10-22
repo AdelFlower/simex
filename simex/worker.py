@@ -202,6 +202,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--engine', choices=['mujoco', 'isaac'], required=True)
     args = parser.parse_args()
+    if args.engine == 'isaac' and os.environ.get('SIMEX_FORBID_ISAAC') == '1':
+        raise RuntimeError('Isaac execution is disabled for offline acceptance')
     backend = None
     recorder = None
     print(PREFIX + json.dumps({'id': 0, 'ok': True, 'result': 'process_ready'}), flush=True)
@@ -217,7 +219,17 @@ def main():
                 else:
                     from simex_private.isaac_backend import IsaacBackend
                     backend = IsaacBackend(kwargs)
-                result = 'ready'
+                if args.engine == 'mujoco':
+                    import mujoco
+                    version = mujoco.__version__
+                else:
+                    try:
+                        from isaacsim.core.version import get_version
+                        version = get_version()[0]
+                    except (ImportError, AttributeError):
+                        import importlib.metadata
+                        version = importlib.metadata.version('isaacsim')
+                result = {'state': 'ready', 'engine': args.engine, 'version': version}
             elif method == 'reset':
                 if recorder:
                     backend.on_step = None

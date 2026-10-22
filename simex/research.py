@@ -112,7 +112,12 @@ def _agent_capacity(agent):
         return
     settings = getattr(agent, "config", {})
     count = getattr(agent, "count", None)
-    limit = settings.get("max_agent_calls", 800) if isinstance(settings, dict) else 800
+    if isinstance(settings, dict) and settings.get('protocol') == 'simex_workspace_v1':
+        limit = settings.get('model_request_limit')
+        if type(limit) is not int or limit < 1:
+            raise AgentBudgetExhausted('An explicit actual-request limit is required')
+    else:
+        limit = settings.get("max_agent_calls", 800) if isinstance(settings, dict) else 800
     if isinstance(count, int) and count >= int(limit):
         raise AgentBudgetExhausted("Model-call budget exhausted; no further rollout has been scheduled")
 
@@ -446,6 +451,11 @@ def _ask(agent, path: Path, role: str, instruction: str, payload: dict) -> dict:
     """
     from .agent import AgentTransportError
 
+    if callable(getattr(agent, 'research_decision', None)):
+        # Workspace agents read complete public artifacts in an isolated session.
+        # Legacy bounded text dialogues remain unchanged for old protocols.
+        return agent.research_decision(path, role, instruction, payload)
+
     previous = _json(path)
     if previous is not None:
         return previous["response"]
@@ -560,6 +570,12 @@ def _public(result: dict) -> dict:
                "actions", "action_summary",
                "video", "recording_errors", "evidence_errors")
     selected = {key: evidence[key] for key in allowed if key in evidence}
+    if result.get('score_version') == 'released_placement_v1' and result.get('library_sha256'):
+        # Workspace runs expose the actual script and complete approved artifact
+        # inventory. The workspace broker copies these files, never private data.
+        root = Path(result['output_dir'])
+        selected['policy'] = str(root / 'policy.py')
+        selected['public_artifacts'] = [str(path) for path in (root / 'public').rglob('*') if path.is_file()]
     # Keep raw public evidence available to the read broker. It replaces traces
     # and original image inventories with IDs instead of discarding them.
     return {"status": result.get("status"), "success": bool(result.get("success")),
@@ -619,13 +635,16 @@ def _started_without_outcome(out: Path, result: dict | None) -> bool:
 
 def _run(runner, engine: str, task: dict, toolbox: Path, out: Path,
          script: str | None = None, source_config: dict | None = None, source_model=None) -> dict:
+    workspace_protocol = getattr(runner, 'config', {}).get('protocol') == 'simex_workspace_v1'
+    if workspace_protocol and engine == 'mujoco' and source_model is None:
+        source_model = getattr(runner, 'source_model', None)
     request = {"engine": engine, "task": task, "toolbox_sha256": toolbox_hash(toolbox),
                "script_sha256": _digest(script), "source_config": source_config or {}}
     if source_model is not None:
         from .source_model import check_model, model_hash
         check_model(source_model)
         request['source_model_sha256'] = model_hash(source_model)
-    strict = source_model is not None or getattr(runner, 'config', {}).get('protocol') == 'supplied_skill_stage2_v1'
+    strict = source_model is not None or workspace_protocol or getattr(runner, 'config', {}).get('protocol') == 'supplied_skill_stage2_v1'
     request_path = out / "research_request.json"
     old = _json(request_path)
     if old is not None and (old != request if strict else any(old.get(key) != request[key]
@@ -639,7 +658,7 @@ def _run(runner, engine: str, task: dict, toolbox: Path, out: Path,
     if previous is not None and previous.get("status") != "infrastructure_error":
         if previous.get("failure_kind") == "infrastructure":
             raise ResearchError(f"Infrastructure interrupted this rollout; recover its outcome before continuing: {out}")
-        if getattr(runner, 'config', {}).get('protocol') == 'supplied_skill_stage2_v1':
+        if workspace_protocol or getattr(runner, 'config', {}).get('protocol') == 'supplied_skill_stage2_v1':
             from .stage2 import check_rollout
             check_rollout(out)
         return previous
@@ -660,7 +679,7 @@ def _run(runner, engine: str, task: dict, toolbox: Path, out: Path,
     if not isinstance(result, dict):
         raise ResearchError("Runner did not return a result object")
     _save(result_path, result)
-    if getattr(runner, 'config', {}).get('protocol') == 'supplied_skill_stage2_v1':
+    if workspace_protocol or getattr(runner, 'config', {}).get('protocol') == 'supplied_skill_stage2_v1':
         from .stage2 import seal_rollout
         seal_rollout(out)
     attempts = out / "research_attempts"
@@ -722,6 +741,10 @@ def _target(runner, run_dir: Path, slot_key: str, toolbox: Path, out: Path) -> d
             else:
                 slot["state"] = ("pending_infrastructure" if existing is not None and
                                  existing.get("status") == "infrastructure_error" else "unresolved")
+                if (getattr(runner, 'config', {}).get('protocol') == 'simex_workspace_v1'
+                        and not (out / 'operation_input.json').exists()
+                        and not _json(out / 'execution.json', {}).get('actual_started')):
+                    slot['state'] = 'pending_infrastructure'
             _save(ledger_path, ledger)
             raise
     if result.get("failure_kind") == "infrastructure" and result.get("actual_started"):
@@ -738,6 +761,8 @@ def _target(runner, run_dir: Path, slot_key: str, toolbox: Path, out: Path) -> d
                 actual_started=result.get("actual_started"),
                 toolbox_sha256=toolbox_hash(toolbox), result_sha256=_digest(result))
     _save(ledger_path, ledger)
+    if callable(getattr(runner, 'refresh', None)):
+        runner.refresh()
     return result
 
 
@@ -1655,6 +1680,9 @@ def report(run_dir: Path) -> dict:
     manifest = _json(run_dir / "manifest.json")
     if not manifest:
         raise ResearchError(f"No experiment manifest in {run_dir}")
+    if manifest.get('protocol') == 'simex_workspace_v1':
+        from .lab.reporting import report as workspace_report
+        return workspace_report(run_dir)
     if manifest.get('config', {}).get('protocol') == 'supplied_skill_stage2_v1':
         from .stage2 import report as supplied_report
         return supplied_report(run_dir)
