@@ -2,6 +2,7 @@
 protocol: simex_workspace_v1
 route: learned
 model: gpt-6-astra
+model_auth: codex_chatgpt
 cli_version: 0.162.1
 research_image: simex-research:0.162.1
 repetitions: 5
@@ -25,7 +26,8 @@ evaluation_reasoning_effort: medium
 placement_contract: released_placement_v1
 source_calibration_profile: code_v1
 seed: 20261024
-# Set --model-request-limit and the host gateway URL for an explicitly authorized run.
+# Set --model-request-limit. By default reuse the host Codex ChatGPT login.
+# For API-key access explicitly change model_auth to api_key and set:
 # model_gateway_url: https://your-provider.example/v1
 # model_key_env: SIMEX_MODEL_API_KEY
 # observation: /absolute/path/to/public_rgbd.npz

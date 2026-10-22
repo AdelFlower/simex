@@ -73,6 +73,14 @@ Preparation 另包含经过哈希检查的允许源资产副本。校准只允�
 未确认请求保守保留计数，不退款。记录有效回复、失败分类及每请求 token 用量，
 不把 CLI 的累计 turn 用量重复相加。请求上限没有默认值，也不继承旧实验预算。
 
+认证可选 `codex_chatgpt`（默认配置）或 `api_key`。前者由宿主读取现有 Codex 文件登录，
+向固定的 ChatGPT Codex 上游发送凭据；容器只持有会话网关令牌。过期登录由固定 CLI 的
+`account/read(refreshToken=true)` 刷新，不在研究容器实现登录，也不将登录状态复制到工作区。
+OAuth 刷新不是模型推理；失败的刷新不消耗推理请求额度，实际发送的模型请求均计数。
+认证拒绝会明确报错，重新登录后按运行台账恢复。适配依据
+[官方 ChatGPT 网关文档](https://learn.chatgpt.com/docs/enterprise/sign-in-with-chatgpt-through-a-gateway)
+及本机 CLI 0.162.1 导出的认证协议；容器隔离边界保持不变。
+
 网络、明确容量不足、可重试服务故障最多恢复五次；非法策略、模型代码错误不作为
 服务故障重试。网关缓冲完整响应后才向 CLI 交付，防止断流中的部分工具调用被重复
 执行。恢复使用明确的 `codex exec resume SESSION_ID`，先核对操作台账和输入哈希。

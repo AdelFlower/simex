@@ -9,4 +9,7 @@ source "$SIMEX_ISAAC_ROOT/setup_conda_env.sh"
 # The distribution's Kit loader needs the conda X11 libraries on this machine.
 export LD_LIBRARY_PATH="$CONDA_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 export PYTHONUNBUFFERED=1
-exec python "$@"
+# An activated project venv can remain ahead of conda on PATH. Use the
+# interpreter belonging to the environment we just activated explicitly.
+unset VIRTUAL_ENV
+exec "$CONDA_PREFIX/bin/python" "$@"

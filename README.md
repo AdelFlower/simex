@@ -4,7 +4,7 @@
 借鉴 EmbodiedEvo 的研究会话、工作区、经验记录、执行留档与恢复机制，保持 SimEX 的单轮无工具执行策略边界。
 
 当前改造只做离线验收。模拟服务结果、人工 `direct_plate` 回归不能作为自主 Stage1 学习或 Stage2 迁移成功。
-本次[离线验收记录](docs/offline-acceptance-workspace-v1.md)：631 项测试通过，人工技能 MuJoCo 八场景 8/8，真实模型请求与 Isaac 目标执行均为 0。
+基础版本的[离线验收记录](docs/offline-acceptance-workspace-v1.md)：631 项测试通过，人工技能 MuJoCo 八场景 8/8，真实模型请求与 Isaac 目标执行均为 0。后续的 Codex 登录适配需使用新目录，不能续跑该冻结验收。
 旧运行保持独立；历史说明见 [历史 README](docs/history/README-before-workspace-v1.md)。
 方法与差异见 [协议说明](docs/workspace-protocol.md)。
 
@@ -28,6 +28,37 @@ cd ..
 
 单独检查代码：`.venv/bin/python -m pytest -q`。
 
+## 沿用现有 Codex Astra 登录
+
+两个默认配置都使用 `model_auth: codex_chatgpt`，沿用宿主 Codex 的 ChatGPT 登录，
+**无需另配 API Key 或模型服务地址**。本机 CLI 0.162.1 的登录文件由宿主读取；过期时通过
+CLI 的 `account/read` 认证接口刷新。凭据不会挂入研究容器，也不写入运行日志。
+没有文件形式的有效 ChatGPT 登录时，先运行项目 CLI 登录命令。
+该适配的 28 项相关回归通过，[验收记录](runs/codex_auth_acceptance_20261022_v1/acceptance.json)
+明确区分了原生认证接口、模拟上游测试和仍需执行的真实模型连通性检查。
+
+```bash
+.tools/node_modules/.bin/codex login status
+# 仅在未登录或登录已失效时运行：
+.tools/node_modules/.bin/codex login
+```
+
+正式实验前，在独立新目录执行一次模型连通性检查。**此命令会实际调用 Astra**，请求上限为 1，
+不启动任何模拟器、不计作研究结果。账户权限、服务容量和当前网络都以该检查的实际结果为准。
+
+```bash
+.venv/bin/python -m simex.lab.model_check \
+  --config configs/workspace.yaml \
+  --run "runs/model_check_$(date +%Y%m%d_%H%M%S)" \
+  --model-request-limit 1
+```
+
+成功会打印 `Model connection passed`；失败原因和实际请求计数保存在 `connection_check.json`。
+需要重试时使用新目录并重新明确请求上限。实验的请求预算独立于此检查。
+
+若确实希望使用 API Key，显式设置 `model_auth: api_key`，再填写 `model_gateway_url`
+并设置 `SIMEX_MODEL_API_KEY`。两种认证均经过同一网关计数，账户额度与实验请求上限分别生效。
+
 ## 新自主实验的启动配置
 
 默认 [configs/workspace.yaml](configs/workspace.yaml)：4 个成员、每成员 20 周期，
@@ -38,7 +69,7 @@ cd ..
 
 - 冻结的公开 RGBD NPZ，字段 `rgb`、`depth`、`intrinsics`、`camera_to_world`，640×480；禁止 pickle。
 - 工作区文字说明和允许使用的源资产目录。
-- 宿主模型服务的 Responses 地址 `model_gateway_url`，以及环境变量 `SIMEX_MODEL_API_KEY`。
+- 宿主有效的 Codex ChatGPT 登录（默认）；API Key 入口的额外配置见上文。
 - **显式 `model_request_limit` 或 `--model-request-limit`**。没有默认预算，不继承旧实验额度。
 
 在新配置副本中填入这些字段。以下命令是后续正式实验入口，本次交付不执行它们：
@@ -66,7 +97,17 @@ cd ..
 
 两条入口共享 Stage2 的代码模型校准、固定脚本回放、四假设筛选和冻结评估。
 源模型提供 XML、命令时长、逐步控制三个扩展点；真实物理步进、观测、RobotAPI 和评分由宿主管理。
-后续正式运行需另建目录，配置模型服务并显式设定请求上限。
+模型连通性检查通过后，人工能力的正式 Stage2 可直接启动，不需要 Preparation 输入：
+
+```bash
+.venv/bin/python -m simex stage2 \
+  --config configs/workspace_supplied.yaml \
+  --run "runs/skill_stage2_codex_$(date +%Y%m%d_%H%M%S)" \
+  --model-request-limit 2000
+```
+
+这会先验收人工技能源域八场景，再执行 Isaac 适应和两方法冻结评估，共 45 个目标槽位。
+`2000` 是此示例明确设置的总请求上限，包含策略、研究会话、压缩和重试，达到上限会停止。
 
 ## 状态、审计与恢复
 
@@ -81,6 +122,11 @@ cd ..
 `status`、`verify` 可读旧记录；旧格式的详细审计仍可使用 `scripts/verify_run.py`。
 `scripts/status.py` 和 `scripts/verify_run.py` 也是新协议的兼容入口。
 `resume` 只支持新协议，先核对冻结哈希与执行台账，不接受已开始但结果丢失的自动重跑。
+修复代码后，原运行的实现哈希会不匹配，必须用新的运行目录启动；不要删除旧台账或修改冻结哈希来续跑。
+启动失败可先检查 `requests/<编号>/result.json`、`response_metadata.json` 和 `response.bin`，
+以及当前执行目录的 `policy_generation.json`、`private/failure.json` 和重复目录的 `isaac_worker.log`。
+模型生成失败会在启动仿真器前停止。Isaac 启动脚本显式选择 `isaac-sim` 环境的解释器，
+避免终端已激活的仓库 `.venv` 带入不兼容的 NumPy。
 
 研究工作区只读规则和公开证据，可写笔记与当前阶段草稿。持久研究代理通过
 `status / submit / test / commit / finish` 操作；未测试草稿不能成为最终能力。
@@ -89,6 +135,26 @@ cd ..
 报告自动刷新并区分：预置技能源域验证、Stage1 流程与子能力证据、完整源任务成功、
 Stage2 流程完成、目标成功和相对基线改善。每条执行记录关联视频、实际策略、能力版本、
 源模型版本、引擎版本和 `released_placement_v1` 评分版本。
+
+## 在 Isaac 三维窗口中观察已执行的策略
+
+独立诊断入口读取一次目标执行保存的 `policy.py`、能力库快照和实际初始场景，校验哈希后重新执行。
+不调用模型，不改写原实验，不计入正式评估；重新仿真不保证逐帧复现原录像。
+请在有桌面显示的本机终端运行，优先等待研究实验结束后查看。
+若手动停止研究实验，应确认没有正在进行的物理执行；已开始但未完成的执行不能自动重跑。
+
+```bash
+.venv/bin/python scripts/view_isaac_policy.py \
+  --execution runs/YOUR_RUN/repetitions/00/adaptation/far_plate/trial_00/target \
+  --speed 0.5
+```
+
+场景打开后，在 Isaac 的 Perspective 视口选择观察角度，再回到终端按 Enter 开始执行。
+可在三维窗口中缩放、旋转视角；不要切换到用于策略感知的 overhead/wrist 相机后修改其位姿，
+也不要手动移动物体或改动物理参数。执行结束后窗口保留，终端再次按 Enter 关闭。
+`--speed 0.5` 通过真实时间等待限制到至多半速，不改变仿真步长或控制参数。
+独立输出默认保存在 `runs/isaac_view_*`，`--check-only` 可只检查输入而不启动仿真。
+该脚本使用全局仿真锁，其他物理执行占用时会拒绝启动；脚本不属于冻结研究实现。
 
 ## 主要实现
 

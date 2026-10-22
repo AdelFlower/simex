@@ -51,7 +51,10 @@ class TrackedRunner:
         # generation disconnect therefore leaves a resumable, unstarted slot.
         self._inject('before_policy')
         if script is None:
-            self.delegate.prepare_policy(task, toolbox, out)
+            prepared = self.delegate.prepare_policy(task, toolbox, out)
+            if prepared and prepared.get('status') == 'generation_error':
+                raise ResearchError('Policy generation failed before simulator startup: ' +
+                                    prepared.get('reason', 'see policy_generation.json'))
         self._inject('before_execution')
         ident = 'physics/' + str(out.relative_to(self.run_dir.resolve()))
         request = {'engine': engine, 'task_sha256': sha(task), 'library_sha256': r.toolbox_hash(toolbox),

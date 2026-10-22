@@ -7,7 +7,7 @@ import signal
 from . import PROTOCOL
 from .protocol import initialize, check_resume, ROOT
 from .records import immutable, read, save
-from .gateway import Gateway, HTTPProvider, PolicyWriter
+from .gateway import Gateway, configured_provider, PolicyWriter
 from .session import ResearchAgent
 from .execution import TrackedRunner
 from .reporting import report, verify, process_record
@@ -59,8 +59,7 @@ def execute(command, run, config, *, provider=None, research_agent=None,
         if type(cfg.get('model_request_limit')) is not int or cfg['model_request_limit'] < 1:
             raise ResearchError('Explicit --model-request-limit is required for a new formal experiment')
         if provider is None:
-            provider = HTTPProvider(cfg.get('model_gateway_url', ''),
-                                    cfg.get('model_key_env', 'SIMEX_MODEL_API_KEY'))
+            provider = configured_provider(cfg)
         if bool(provider.simulated) != offline:
             raise ResearchError('Provider type must agree with the frozen experiment mode')
         gateway = Gateway(run, cfg['model_request_limit'], provider)

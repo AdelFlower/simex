@@ -16,6 +16,38 @@ def request():
     return {'model': 'gpt-6-astra', 'input': [{'role': 'user', 'content': 'offline'}]}
 
 
+@pytest.mark.parametrize('header', ['application/json', 'text/plain', 'text/event-stream'])
+def test_mislabeled_sse_is_parsed_and_forwarded_as_a_stream(tmp_path, header):
+    _, _, body = response_bytes('SIMEX_CODEX_OK', stream=True)
+    provider = ScriptedProvider([(200, header, body)])
+    gateway = Gateway(tmp_path, 1, provider)
+    content_type, raw, response = gateway.infer(gateway.grant('test', kind='policy'), request())
+    assert content_type == 'text/event-stream' and raw == body
+    assert response['output'][0]['content'][0]['text'] == 'SIMEX_CODEX_OK'
+    assert gateway.journal.budget()['valid_replies'] == 1
+    meta = json.loads((tmp_path / 'requests/0000001/response_metadata.json').read_text())
+    assert meta['upstream_content_type'] == header
+
+
+def test_mislabeled_incomplete_stream_retries_and_preserves_failed_bytes(tmp_path):
+    body = b'event: response.created\ndata:{"type":"response.created"}\n\n'
+    provider = ScriptedProvider([(200, 'application/json', body), response_bytes('ok', stream=True)])
+    gateway = Gateway(tmp_path, 2, provider, sleeper=lambda _: None)
+    gateway.infer(gateway.grant('test'), request())
+    assert gateway.journal.budget()['sent'] == 2
+    assert gateway.journal.rows('requests')[0]['failure'] == 'network'
+    assert (tmp_path / 'requests/0000001/response.bin').read_bytes() == body
+
+
+def test_non_stream_invalid_response_keeps_evidence_without_retry(tmp_path):
+    body = b'<html>upstream unavailable</html>'
+    gateway = Gateway(tmp_path, 2, ScriptedProvider([(200, 'text/html', body)]))
+    with pytest.raises(ProviderFailure):
+        gateway.infer(gateway.grant('test'), request())
+    assert gateway.journal.budget()['sent'] == 1
+    assert (tmp_path / 'requests/0000001/response.bin').read_bytes() == body
+
+
 def test_gateway_counts_retries_compaction_and_failures_without_refund(tmp_path):
     provider = ScriptedProvider([ConnectionError('offline disconnect'),
         (503, 'application/json', b'{"error":"Selected model is at capacity. Please try a different model."}'),

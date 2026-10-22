@@ -179,6 +179,23 @@ def test_offline_mode_refuses_a_real_target_runner(tmp_path):
         runner.rollout('isaac', make_task('far_plate', 0), tmp_path, tmp_path / 'attempt')
 
 
+def test_generation_failure_does_not_allocate_or_start_physics(tmp_path):
+    cfg = configuration({'repetitions': 1, 'model_request_limit': 10}, offline=True)
+    run = tmp_path / 'run'; rep = run / 'repetitions/00'
+    initialize(run, cfg, offline=True)
+    snapshot(DEFAULT_CODE, rep / 'source_models/initial')
+    r._freeze(Path('simex/initial'), rep / 'frozen/initial')
+    gateway = Gateway(run, 10, LifecycleProvider())
+    from simex.lab.gateway import PolicyWriter
+    delegate = MockRunner(PolicyWriter(gateway, cfg), rep, cfg)
+    delegate.prepare_policy = lambda *a: {'status': 'generation_error', 'reason': 'bad response'}
+    runner = TrackedRunner(delegate, run, rep, cfg)
+    with pytest.raises(ResearchError, match='before simulator startup: bad response'):
+        runner.rollout('isaac', make_task('far_plate', 0), rep / 'frozen/initial', rep / 'unstarted')
+    assert not delegate.calls
+    assert not runner.journal.rows('operations')
+
+
 def test_missing_public_evidence_is_retained_but_cannot_pass(tmp_path):
     cfg = configuration({'repetitions': 1, 'model_request_limit': 10}, offline=True)
     run = tmp_path / 'run'; rep = run / 'repetitions/00'

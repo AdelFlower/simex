@@ -20,6 +20,16 @@ from .records import Journal, save
 BACKOFF = (5, 15, 30, 60, 60)
 
 
+def configured_provider(config):
+    mode = config.get('model_auth', 'api_key')
+    if mode == 'codex_chatgpt':
+        from .codex_auth import CodexChatGPTProvider
+        return CodexChatGPTProvider()
+    if mode == 'api_key':
+        return HTTPProvider(config.get('model_gateway_url', ''), config.get('model_key_env', 'SIMEX_MODEL_API_KEY'))
+    raise ResearchError('model_auth must be codex_chatgpt or api_key')
+
+
 class ProviderFailure(AgentError):
     def __init__(self, category, message, retryable=False):
         super().__init__(message)
@@ -35,8 +45,16 @@ def classify(status, body):
     return 'invalid_request', False
 
 
+def response_content_type(body, content_type):
+    # Some upstream gateways label a valid SSE body as application/json.
+    # Normalize the header for both our parser and downstream Codex clients.
+    if body.lstrip().startswith((b'event:', b'data:', b':')):
+        return 'text/event-stream'
+    return content_type
+
+
 def completed_response(body, content_type):
-    if 'event-stream' not in content_type:
+    if 'event-stream' not in response_content_type(body, content_type):
         value = json.loads(body)
         if value.get('error'):
             category, retryable = classify(500 if 'capacity' in str(value['error']).lower() else 400, str(value['error']))
@@ -44,9 +62,12 @@ def completed_response(body, content_type):
         return value
     response = None
     for line in body.decode().splitlines():
-        if not line.startswith('data: ') or line == 'data: [DONE]':
+        if not line.startswith('data:'):
             continue
-        event = json.loads(line[6:])
+        data = line[5:].lstrip()
+        if not data or data == '[DONE]':
+            continue
+        event = json.loads(data)
         if event.get('type') == 'response.completed':
             response = event['response']
         if event.get('type') in ('error', 'response.failed'):
@@ -128,9 +149,13 @@ class Gateway:
         last_text = ''.join(x.get('text', '') for x in content if isinstance(x, dict)) if isinstance(content, list) else content
         local_compaction = isinstance(last_text, str) and last_text.startswith('You are performing a CONTEXT CHECKPOINT COMPACTION.')
         kind = 'compaction' if endpoint.endswith('/compact') or local_compaction else grant['kind']
+        if hasattr(self.provider, 'prepare_body'):
+            body = self.provider.prepare_body(body, endpoint)
         # Buffer until the response is complete. A broken stream cannot expose
         # partial tool calls before retry, and each outgoing retry is charged.
         for attempt in range(len(BACKOFF)+1):
+            if hasattr(self.provider, 'prepare'):
+                self.provider.prepare()
             ident = self.journal.reserve_request(grant['scope'], kind, body, self.limit,
                       simulated=self.provider.simulated, scope_limit=grant['scope_limit'])
             directory = self.directory / 'requests' / f'{ident:07d}'
@@ -141,6 +166,12 @@ class Gateway:
                 grant['last_activity'] = time.monotonic()
             try:
                 status, content_type, raw = self.provider.request(endpoint, body)
+                (directory / 'response.bin').write_bytes(raw)
+                normalized_type = response_content_type(raw, content_type)
+                save(directory / 'response_metadata.json', {'http_status': status,
+                    'upstream_content_type': content_type, 'content_type': normalized_type,
+                    'bytes': len(raw)})
+                content_type = normalized_type
                 if status >= 400:
                     category, retryable = classify(status, raw)
                     raise ProviderFailure(category, raw.decode(errors='replace'), retryable)
@@ -148,7 +179,6 @@ class Gateway:
                 if grant['kind'] == 'policy' and any(x.get('type') not in ('message', 'reasoning')
                                                       for x in response.get('output', [])):
                     raise ProviderFailure('illegal_policy', 'Policy attempted tool use')
-                (directory / 'response.bin').write_bytes(raw)
                 save(directory / 'result.json', {'status': 'replied', 'usage': response.get('usage', {})})
                 self.journal.finish_request(ident, usage=response.get('usage'), response=response)
                 return content_type, raw, response
